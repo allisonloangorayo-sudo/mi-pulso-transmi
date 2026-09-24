@@ -3,7 +3,7 @@ name: pulso-transmi-infer
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 * * * *"   # cada hora, 10 min después del collector
+    - cron: "*/10 * * * *"   # cada 10 min (recomendación oficial; ventana real dura 25 min)
 
 concurrency:
   group: pulso-transmi-infer

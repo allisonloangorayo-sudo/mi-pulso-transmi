@@ -1,11 +1,9 @@
-"""Inferencia y submission, siguiendo el contrato de la guía operativa v2.0.
+"""Inferencia y submission contra la API real de Pulso TransMi.
 
-IMPORTANTE — estado actual: la API pública (SDK 0.2.0) todavía NO expone
-`/v1/forecast-cycles/current` ni el endpoint de submissions; por eso este
-módulo es un scaffold fiel al flujo documentado (páginas 5-7 de la guía
-operativa), listo para activarse cuando el profesor habilite la ventana
-competitiva. Las partes bloqueadas por falta de endpoint público están
-marcadas con TODO y no deben ejecutarse en producción todavía.
+Ventana competitiva activa desde 2026-09-24 (clock state=running, API
+0.7.1). Esquema de /v1/submissions confirmado en producción (201 accepted
+con una entrega real). Ver docs/api.md del SDK del profesor para filtros;
+el contrato de submissions vive en el openapi.json del servidor.
 
 Flujo (no reintenta a ciegas; reutiliza idempotency-key; 404 = salida en verde):
     sync -> get_current_cycle -> receipt_exists? -> load_champion ->
@@ -80,14 +78,51 @@ def receipt_exists(cycle_id: str, model_version: str) -> bool:
     return bool(result.data)
 
 
+def fetch_all_observations() -> pd.DataFrame:
+    """Histórico estático (/v1/observations) + incremental liberado
+    (/v1/stream/observations). El primero se congela en el corte inicial del
+    dataset; los datos de la ventana competitiva solo llegan por el stream
+    (confirmado en producción: /v1/observations no incluye nada después de
+    history_end aunque el ciclo pida un data_cutoff mucho más reciente).
+    """
+    with PulsoTransmiClient() as client:
+        static_obs = client.observations_dataframe()
+
+    headers = {"Authorization": f"Bearer {PULSO_API_KEY}"} if PULSO_API_KEY else {}
+    cursor = None
+    stream_frames = []
+    while True:
+        params = {"limit": 5000}
+        if cursor:
+            params["cursor"] = cursor
+        response = httpx.get(f"{PULSO_API_URL}/v1/stream/observations", params=params, headers=headers, timeout=45)
+        response.raise_for_status()
+        page = response.json()
+        if page["data"]:
+            stream_frames.append(pd.DataFrame(page["data"]))
+        cursor = page.get("next_cursor")
+        if cursor is None:
+            break
+
+    if stream_frames:
+        stream_df = pd.concat(stream_frames, ignore_index=True)
+        stream_df["observed_at"] = pd.to_datetime(stream_df["observed_at"], utc=True)
+        stream_df["station_id"] = stream_df["station_id"].astype("string")
+        stream_df = stream_df[["station_id", "observed_at", "demand"]]
+        return pd.concat([static_obs, stream_df], ignore_index=True).drop_duplicates(
+            subset=["station_id", "observed_at"]
+        )
+    return static_obs
+
+
 def build_features_as_of(data_cutoff: str, targets: list[dict]) -> pd.DataFrame:
     """Última fila de features conocida por estación (lags fijos al cutoff,
     calendario tomado del target_at futuro). Ver README para su limitación
     conocida (mismo bloque de lags para los 4 horizontes) y cómo mejorarla.
     """
     cutoff_ts = pd.Timestamp(data_cutoff)
-    with PulsoTransmiClient() as client:
-        observations = client.observations_dataframe(end=cutoff_ts.isoformat())
+    observations = fetch_all_observations()
+    observations = observations[observations["observed_at"] <= cutoff_ts]
 
     features_df = build_features(observations)
     latest = features_df.sort_values("observed_at").groupby("station_id").tail(1).set_index("station_id")
@@ -134,15 +169,35 @@ def stable_key(cycle_id: str, model_version: str, predictions: pd.DataFrame) -> 
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def submit_predictions(cycle_id: str, predictions: pd.DataFrame, idempotency_key: str, model_metadata: dict) -> dict:
-    """TODO: ruta y payload exactos se publican en el contrato técnico oficial
-    (repositorio uexternadojz/pulso-transmi) cuando se habiliten submissions.
-    Placeholder de la forma documentada en la guía operativa (p.7-8).
+def submit_predictions(
+    cycle_id: str, data_cutoff: str, predictions: pd.DataFrame, idempotency_key: str, champion: dict
+) -> dict:
+    """POST /v1/submissions (esquema confirmado en producción: 201 accepted).
+
+    client_run_id (body) e Idempotency-Key (header) usan la misma llave: para
+    el mismo ciclo y contenido, un reintento de red reutiliza la llave en vez
+    de crear una entrega nueva (regla de la guía operativa p.5).
     """
-    raise NotImplementedError(
-        "El endpoint de submissions aún no está publicado. Actualiza esta función "
-        "con la ruta y el payload del contrato técnico cuando se habilite."
-    )
+    payload = {
+        "schema_version": "1.0",
+        "cycle_id": cycle_id,
+        "client_run_id": idempotency_key,
+        "data_cutoff": data_cutoff,
+        "model": {
+            "version": champion["version"],
+            "trained_at": champion.get("trained_at"),
+            "training_data_end": champion.get("data_cutoff"),
+            "git_commit": champion.get("commit_sha"),
+        },
+        "predictions": [
+            {"station_id": row["station_id"], "target_at": row["target_at"], "value": float(row["value"])}
+            for row in predictions.to_dict(orient="records")
+        ],
+    }
+    headers = {"Authorization": f"Bearer {PULSO_API_KEY}", "Idempotency-Key": idempotency_key}
+    response = httpx.post(f"{PULSO_API_URL}/v1/submissions", json=payload, headers=headers, timeout=45)
+    response.raise_for_status()
+    return response.json()
 
 
 def save_receipt(cycle_id: str, model_version: str, predictions: pd.DataFrame, submission_id: str, idempotency_key: str) -> None:
@@ -181,9 +236,13 @@ def run() -> None:
     validate_exact_targets(features_df, cycle["targets"])
 
     key = stable_key(cycle["cycle_id"], champion["version"], features_df)
-    receipt = submit_predictions(cycle["cycle_id"], features_df, key, champion)
+    receipt = submit_predictions(cycle["cycle_id"], cycle["data_cutoff"], features_df, key, champion)
     save_receipt(cycle["cycle_id"], champion["version"], features_df, receipt["submission_id"], key)
-    print(f"Entregado ciclo {cycle['cycle_id']} con {champion['version']}.")
+    print(
+        f"Entregado ciclo {cycle['cycle_id']} con {champion['version']}: "
+        f"{receipt['predictions_received']}/{receipt['expected_predictions']} predicciones, "
+        f"status={receipt['status']}."
+    )
 
 
 if __name__ == "__main__":

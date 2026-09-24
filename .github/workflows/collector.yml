@@ -3,7 +3,7 @@ name: pulso-transmi-collector
 on:
   workflow_dispatch:
   schedule:
-    - cron: "5 * * * *"   # cada hora, minuto 5
+    - cron: "*/10 * * * *"   # cada 10 min (recomendación oficial; ventana real dura 25 min)
 
 concurrency:
   group: pulso-transmi-collector
@@ -26,6 +26,7 @@ jobs:
       - name: Sincronizar histórico/incremental a Supabase (idempotente)
         env:
           PULSO_API_URL: ${{ vars.PULSO_API_URL }}
+          PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python -m src.ingest

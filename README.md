@@ -3,22 +3,30 @@
 Proyecto de equipo — reto MLOps Pulso TransMi (Universidad Externado de Colombia).
 Construido sobre el [SDK oficial del profesor](https://github.com/uexternadojz/pulso-transmi-sdk).
 
-## Estado actual (2026-09-24)
+## Estado actual (2026-09-24, actualizado 03:55 UTC)
 
-La API pública sigue en modo **solo lectura** (`0.2.0`): expone histórico
-estático (45 días, 12 estaciones, 51.840 observaciones), pero **todavía no
-publica** `/v1/forecast-cycles/current` ni el endpoint de submissions. Estamos
-en la **Fase 1 — datos estáticos** del taller, no en la ventana competitiva.
+**La ventana competitiva está activa.** La API subió de `0.2.0` a `0.7.1`,
+`/v1/clock` reporta `state: running`, y `/v1/forecast-cycles/current` +
+`/v1/submissions` + `/v1/leaderboard` ya funcionan de verdad. Confirmado en
+producción: nuestra primera submission real fue aceptada (`201`, 48/48
+predicciones, `is_official: true`).
 
-Por eso `src/predict.py` (contrato oficial) queda como scaffold con las
-partes bloqueadas por la API marcadas `TODO`, mientras que `src/infer.py`
-(el que corre en producción, cada hora) opera en **modo simulado**: avanza un
-reloj propio sobre el histórico ya conocido, genera las 48 predicciones y las
-evalúa de inmediato contra el dato real (que ya tenemos, solo que aún no "ha
-pasado" para el reloj simulado). Esto da accuracy y drift medibles *hoy*, sin
-esperar a que el profesor active la ventana competitiva. En cuanto
-`/v1/forecast-cycles/current` responda con un ciclo real, `infer.py` lo
-detecta solo y cambia automáticamente al flujo oficial de `predict.py`.
+Detalle importante que descubrimos en vivo: `/v1/observations` solo sirve el
+histórico estático original (se congela en `history_end`); los datos nuevos
+de la ventana competitiva **solo** llegan por `/v1/stream/observations`
+(paginado con cursor). Tanto `src/ingest.py` como `src/predict.py` ya
+combinan ambas fuentes.
+
+`src/infer.py` es el punto de entrada real: intenta el ciclo oficial primero
+(`GET /v1/forecast-cycles/current`) y delega en `src/predict.py` si hay uno
+abierto; si no (por ejemplo, entre ciclos), cae a un modo simulado sobre el
+histórico ya conocido para seguir generando accuracy/drift medible sin
+depender de que haya un ciclo abierto en ese instante exacto.
+
+Los ciclos reales duran solo **25 minutos** y no están alineados al reloj de
+pared (el primero abrió a las `:37`, no a `:00`) — por eso `collector.yml` e
+`infer.yml` corren cada **10 minutos**, como recomienda la guía operativa,
+en vez de una vez por hora.
 
 Techo de accuracy observado: el candidato satura alrededor de **86-89** de
 accuracy (WAPE invertido). Es esperable — la demanda es sintética con ruido
@@ -32,15 +40,15 @@ src/
 ├── ingest.py    # collector idempotente: descarga y upsert a Supabase
 ├── features.py  # calendario + rezagos (lags)
 ├── train.py     # baselines + candidato + promoción automática a champion
-├── infer.py     # inferencia horaria: ciclo real si existe, si no simulación
-├── predict.py   # contrato oficial de submissions (scaffold, pendiente de API)
+├── infer.py     # punto de entrada real: ciclo oficial si existe, si no simulación
+├── predict.py   # contrato oficial de submissions (ya en producción)
 ├── drift.py     # accuracy acumulada vs. rolling 24h + dispara reentrenamiento
 ├── monitor.py   # reporte de accuracy legible (offline + Supabase)
 └── db.py        # cliente Supabase: upserts, cursor, bitácora, Storage del modelo
 supabase/schema.sql   # DDL de la memoria operacional (9 tablas)
 .github/workflows/
-├── collector.yml  # cada hora: sincroniza datos a Supabase
-├── infer.yml      # cada hora: 48 predicciones (12 estaciones x 4 horizontes)
+├── collector.yml  # cada 10 min: sincroniza histórico + stream a Supabase
+├── infer.yml      # cada 10 min: 48 predicciones (12 estaciones x 4 horizontes) + submission real
 ├── drift.yml      # cada hora: accuracy/drift; dispara train.yml si cae ≥5 pts
 └── train.yml      # manual + disparado automáticamente por drift.yml
 ```
@@ -49,15 +57,14 @@ supabase/schema.sql   # DDL de la memoria operacional (9 tablas)
 
 | Acción | Cadencia | Qué hace |
 |---|---|---|
-| `collector.yml` | cada hora | Descarga y sincroniza a Supabase (idempotente). Hoy el histórico es estático, así que cada corrida re-sincroniza lo mismo — inofensivo por el upsert, y queda listo para cuando la API empiece a liberar datos nuevos de verdad. |
-| `infer.yml` | cada hora | Genera 48 predicciones (12 estaciones × 4 horizontes: +15/+30/+45/+60 min) con el champion vigente y las evalúa. |
+| `collector.yml` | cada 10 min | Sincroniza histórico + stream incremental a Supabase (idempotente). |
+| `infer.yml` | cada 10 min | Si hay ciclo real abierto: genera 48 predicciones y las envía a `/v1/submissions`. Si no: simula sobre el histórico para seguir midiendo accuracy/drift. |
 | `drift.yml` | cada hora | Calcula accuracy acumulada vs. rolling 24h y la guarda en `drift_metrics`. Si la caída llega a **5 puntos**, dispara `train.yml` automáticamente (`gh workflow run`). |
 | `train.yml` | manual + automático (por drift) | Entrena un candidato, lo compara contra el champion vigente y **lo promueve automáticamente si lo supera** (nunca si no). |
 
-Con el histórico estático de hoy, la caída de accuracy debería mantenerse
-cerca de 0 casi siempre — `train.yml` no debería dispararse solo todavía.
-Eso es lo esperado: el mecanismo ya queda automático y listo, pero solo
-actúa cuando el drift es real (cuando cambien las tendencias, como pediste).
+`collector.yml` e `infer.yml` corren cada 10 minutos porque los ciclos reales
+duran solo 25 minutos y no están alineados al reloj — con menos frecuencia
+se corre el riesgo real de perder la ventana de un ciclo.
 
 ## Puesta en marcha
 
@@ -148,16 +155,18 @@ gh secret set PULSO_API_KEY --body "..."
 GitHub automáticamente — no hay que crearlo. Nunca subas las claves de
 arriba al código ni las imprimas en logs.
 
-## Próximos pasos (cuando se habilite la ventana competitiva)
+## Estado de la ventana competitiva
 
-- [ ] Reemplazar el `TODO` de `submit_predictions()` en `src/predict.py` con
-      la ruta y payload reales del contrato técnico publicado.
-- [ ] Cuando `/v1/forecast-cycles/current` empiece a responder, `infer.py` va
-      a delegar automáticamente en `src.predict` — verificar el primer ciclo
-      real con cuidado (revisar logs de `infer.yml`).
-- [ ] Ajustar la cadencia de `collector.yml`/`infer.yml` a la que anuncie el
-      profesor (la guía operativa sugiere cada 10 min una vez activa la
-      competencia; hoy corren cada hora porque no hay datos nuevos que
-      justifiquen más frecuencia).
-- [ ] Conectar el bono de dashboard (Vercel) a `drift_metrics` y
-      `evaluations` para visualizar la serie de accuracy en tiempo real.
+- [x] `submit_predictions()` implementado contra el endpoint real (`POST
+      /v1/submissions`, esquema confirmado: `schema_version`, `cycle_id`,
+      `client_run_id`, `data_cutoff`, `model`, `predictions[]`).
+- [x] Primera submission oficial aceptada (`201`, 48/48, `is_official: true`).
+- [x] `collector.yml`/`infer.yml` corren cada 10 minutos.
+- [ ] Ver la posición en `/v1/leaderboard` mejora a medida que la API resuelve
+      los targets (los horizontes se evalúan progresivamente, ver guía
+      operativa p.9) y a medida que se acumulan más ciclos entregados.
+- [ ] Conectar el bono de dashboard (Vercel) a `drift_metrics`, `evaluations`
+      y al leaderboard oficial para visualizar todo en tiempo real.
+- [ ] Revisar si conviene ampliar `build_features_as_of` para no repetir el
+      mismo bloque de lags en los 4 horizontes (mejora de precisión, no de
+      correctitud — el envío ya es válido tal como está).
