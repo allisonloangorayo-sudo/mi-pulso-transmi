@@ -1,10 +1,10 @@
 import pandas as pd
 
-from src.features import STEPS_PER_WEEK
-from src.infer import HORIZONS_MIN, _build_batch, _initial_sim_cutoff
+from src.features import HORIZONS, STEPS_PER_WEEK
+from src.infer import _build_targets, _initial_sim_cutoff
 
 
-def _synthetic_observations(stations=("A", "B", "C"), n_periods: int = STEPS_PER_WEEK * 2) -> pd.DataFrame:
+def _synthetic(stations=("A", "B", "C"), n_periods: int = STEPS_PER_WEEK * 2) -> pd.DataFrame:
     index = pd.date_range("2026-01-01", periods=n_periods, freq="15min", tz="UTC")
     frames = [
         pd.DataFrame({"station_id": s, "observed_at": index, "demand": range(n_periods)})
@@ -13,19 +13,20 @@ def _synthetic_observations(stations=("A", "B", "C"), n_periods: int = STEPS_PER
     return pd.concat(frames, ignore_index=True)
 
 
-def test_build_batch_has_one_row_per_station_per_horizon():
-    observations = _synthetic_observations()
-    cutoff = _initial_sim_cutoff(observations) + pd.Timedelta(hours=1)
-    batch = _build_batch(observations, cutoff)
+def test_targets_cover_every_station_and_horizon():
+    observations = _synthetic()
+    cutoff = _initial_sim_cutoff(observations)
+    targets = _build_targets(observations, cutoff)
 
-    assert len(batch) == 3 * len(HORIZONS_MIN)
-    assert set(batch["station_id"]) == {"A", "B", "C"}
-    for minutes in HORIZONS_MIN:
-        assert (cutoff + pd.Timedelta(minutes=minutes)) in set(batch["target_at"])
+    assert len(targets) == 3 * len(HORIZONS)
+    assert set(targets["station_id"]) == {"A", "B", "C"}
+    assert set(targets["horizon"]) == set(HORIZONS)
 
 
-def test_build_batch_has_no_missing_features():
-    observations = _synthetic_observations()
-    cutoff = _initial_sim_cutoff(observations) + pd.Timedelta(hours=1)
-    batch = _build_batch(observations, cutoff)
-    assert not batch.isna().any().any()
+def test_targets_are_15_minutes_apart_after_the_cutoff():
+    observations = _synthetic(stations=("A",))
+    cutoff = _initial_sim_cutoff(observations)
+    targets = _build_targets(observations, cutoff).sort_values("horizon")
+
+    esperados = [cutoff + pd.Timedelta(minutes=15 * h) for h in sorted(HORIZONS)]
+    assert list(targets["target_at"]) == esperados

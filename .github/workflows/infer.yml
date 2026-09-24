@@ -23,6 +23,17 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # El bundle del champion pesa ~5 MB y esta acción corre cada 10 min.
+      # Sin caché serían ~20 GB/mes de egreso desde Supabase Storage, muy por
+      # encima del plan gratuito. Con caché solo se descarga cuando cambia la
+      # versión promovida.
+      - name: Restaurar modelo cacheado
+        uses: actions/cache/restore@v4
+        with:
+          path: artifacts
+          key: modelo-
+          restore-keys: modelo-
+
       - name: Generar 48 predicciones (12 estaciones x 4 horizontes) y evaluarlas
         env:
           PULSO_API_URL: ${{ vars.PULSO_API_URL }}
@@ -30,3 +41,14 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python -m src.infer
+
+      - name: Identificar la versión en disco
+        id: modelo
+        run: echo "version=$(ls artifacts/*.joblib 2>/dev/null | head -1 | xargs -r basename)" >> "$GITHUB_OUTPUT"
+
+      - name: Guardar modelo en caché
+        if: steps.modelo.outputs.version != ''
+        uses: actions/cache/save@v4
+        with:
+          path: artifacts
+          key: modelo-${{ steps.modelo.outputs.version }}

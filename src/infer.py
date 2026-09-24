@@ -2,42 +2,35 @@
 
 Dos modos, elegidos automáticamente:
 
-1. Ciclo real: si `/v1/forecast-cycles/current` responde (competencia activa),
-   delega en `src.predict`, que sigue el contrato oficial al pie de la letra.
-2. Simulación: mientras ese endpoint no exista (fase actual), avanza un
-   "reloj simulado" una hora por corrida sobre el histórico YA conocido.
-   Como el dato real de esos instantes ya está en nuestra base (no es
-   futuro de verdad, es futuro simulado), cada corrida puede evaluarse de
-   inmediato contra `evaluations`. Esto es lo que le da datos reales a
-   `src/drift.py` sin esperar a la ventana competitiva.
-
-Al llegar al final de los 7 días reservados como validación, el reloj
-simulado reinicia (loop) para seguir generando evidencia indefinidamente.
+1. Ciclo real: si `/v1/forecast-cycles/current` responde, delega en
+   `src.predict`, que sigue el contrato oficial.
+2. Simulación: entre ciclos, avanza un "reloj simulado" una hora por corrida
+   sobre el histórico ya conocido. Como el dato real de esos instantes ya
+   está en nuestra base, cada corrida se evalúa de inmediato y alimenta a
+   `src/drift.py` sin esperar a que abra el siguiente ciclo oficial.
 """
 
 from __future__ import annotations
 
 from datetime import timedelta
 
-import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from pulso_transmi import PulsoTransmiClient
 
 from src import db
-from src.features import FEATURE_COLUMNS, build_features
-from src.predict import NoOpenCycle, double_check_predictions, get_current_cycle, load_champion
+from src.data import fetch_all_observations
+from src.features import FEATURE_COLUMNS, HORIZONS, build_serving_design
+from src.predict import (
+    NoOpenCycle,
+    double_check_predictions,
+    get_current_cycle,
+    load_champion,
+)
 
 load_dotenv()
 
 SIM_STEP = timedelta(hours=1)
-HORIZONS_MIN = (15, 30, 45, 60)
-VALIDATION_DAYS = 7  # debe coincidir con src.train.VALIDATION_DAYS
-
-
-def _load_observations() -> pd.DataFrame:
-    with PulsoTransmiClient() as client:
-        return client.observations_dataframe()
+VALIDATION_DAYS = 5  # debe coincidir con src.train.VALIDATION_DAYS
 
 
 def _initial_sim_cutoff(observations: pd.DataFrame) -> pd.Timestamp:
@@ -46,85 +39,72 @@ def _initial_sim_cutoff(observations: pd.DataFrame) -> pd.Timestamp:
 
 def _next_cutoff(observations: pd.DataFrame) -> pd.Timestamp:
     max_ts = observations["observed_at"].max()
-    stored = db.get_state("sim_cutoff")
-    cutoff = pd.Timestamp(stored) if stored else _initial_sim_cutoff(observations)
-    next_cutoff = cutoff + SIM_STEP
-    if next_cutoff + timedelta(minutes=max(HORIZONS_MIN)) > max_ts:
-        next_cutoff = _initial_sim_cutoff(observations) + SIM_STEP
-    return next_cutoff
+    guardado = db.get_state("sim_cutoff")
+    cutoff = pd.Timestamp(guardado) if guardado else _initial_sim_cutoff(observations)
+    siguiente = cutoff + SIM_STEP
+    if siguiente + timedelta(minutes=15 * max(HORIZONS)) > max_ts:
+        siguiente = _initial_sim_cutoff(observations) + SIM_STEP
+    return siguiente
 
 
-def _build_batch(observations: pd.DataFrame, next_cutoff: pd.Timestamp) -> pd.DataFrame:
-    known = observations[observations["observed_at"] <= next_cutoff]
-    features_df = build_features(known)
-    latest = features_df.sort_values("observed_at").groupby("station_id").tail(1).set_index("station_id")
-
-    static_cols = [c for c in FEATURE_COLUMNS if c not in ("hour", "minute", "dayofweek", "is_weekend")]
-    rows = []
-    for station_id in observations["station_id"].unique():
-        if station_id not in latest.index:
-            continue
-        base = latest.loc[station_id]
-        for minutes in HORIZONS_MIN:
-            target_at = next_cutoff + timedelta(minutes=minutes)
-            row = {col: base[col] for col in static_cols}
-            row.update(
-                station_id=station_id,
-                target_at=target_at,
-                hour=target_at.hour,
-                minute=target_at.minute,
-                dayofweek=target_at.dayofweek,
-                is_weekend=int(target_at.dayofweek in (5, 6)),
-            )
-            rows.append(row)
-    return pd.DataFrame(rows)
+def _build_targets(observations: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
+    filas = [
+        {"station_id": station_id, "target_at": cutoff + timedelta(minutes=15 * h), "horizon": h}
+        for station_id in observations["station_id"].unique()
+        for h in HORIZONS
+    ]
+    return pd.DataFrame(filas)
 
 
 def run_simulated_cycle() -> None:
-    observations = _load_observations()
-    next_cutoff = _next_cutoff(observations)
-    batch = _build_batch(observations, next_cutoff)
-    if batch.empty:
-        print("Simulación sin datos suficientes todavía (histórico muy corto).")
+    observations = fetch_all_observations()
+    cutoff = _next_cutoff(observations)
+    targets = _build_targets(observations, cutoff)
+
+    conocido = observations[observations["observed_at"] <= cutoff]
+    design = build_serving_design(conocido, targets).reset_index(drop=True)
+    design = design.dropna(subset=FEATURE_COLUMNS)
+    if design.empty:
+        print("Simulación sin historial suficiente todavía.")
         return
 
-    model, champion = load_champion()
-    batch["value"] = np.clip(double_check_predictions(model, batch), 0, None)
+    bundle, champion = load_champion()
+    design["value"] = double_check_predictions(bundle, design)
 
-    cycle_id = f"sim-{next_cutoff.isoformat()}"
+    cycle_id = f"sim-{cutoff.isoformat()}"
     pred_records = [
         {
             "cycle_id": cycle_id,
-            "station_id": row["station_id"],
-            "target_at": row["target_at"].isoformat(),
+            "station_id": fila["station_id"],
+            "target_at": pd.Timestamp(fila["observed_at"]).isoformat(),
             "model_version": champion["version"],
-            "value": float(row["value"]),
+            "value": float(fila["value"]),
         }
-        for row in batch.to_dict(orient="records")
+        for fila in design.to_dict(orient="records")
     ]
-    db.upsert_in_chunks("predictions", pred_records, on_conflict="cycle_id,station_id,target_at,model_version")
+    db.upsert_in_chunks(
+        "predictions", pred_records, on_conflict="cycle_id,station_id,target_at,model_version"
+    )
 
-    real_lookup = observations.set_index(["station_id", "observed_at"])["demand"]
-    eval_records = []
-    for row in batch.to_dict(orient="records"):
-        key = (row["station_id"], row["target_at"])
-        if key not in real_lookup.index:
+    real = observations.set_index(["station_id", "observed_at"])["demand"]
+    evaluaciones = []
+    for fila in design.to_dict(orient="records"):
+        clave = (fila["station_id"], pd.Timestamp(fila["observed_at"]))
+        if clave not in real.index:
             continue
-        eval_records.append(
-            {
-                "station_id": row["station_id"],
-                "target_at": row["target_at"].isoformat(),
-                "model_version": champion["version"],
-                "predicted": float(row["value"]),
-                "real": float(real_lookup.loc[key]),
-            }
-        )
-    db.insert_evaluations(eval_records)
-    db.set_state("sim_cutoff", next_cutoff.isoformat())
+        evaluaciones.append({
+            "station_id": fila["station_id"],
+            "target_at": clave[1].isoformat(),
+            "model_version": champion["version"],
+            "predicted": float(fila["value"]),
+            "real": float(real.loc[clave]),
+        })
+    db.insert_evaluations(evaluaciones)
+    db.set_state("sim_cutoff", cutoff.isoformat())
 
     print(
         f"[simulación] {cycle_id}: {len(pred_records)} predicciones "
-        f"({len(eval_records)} evaluadas de inmediato) con {champion['version']}."
+        f"({len(evaluaciones)} evaluadas) con {champion['version']}."
     )
 
 

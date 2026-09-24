@@ -1,13 +1,15 @@
 """Inferencia y submission contra la API real de Pulso TransMi.
 
 Ventana competitiva activa desde 2026-09-24 (clock state=running, API
-0.7.1). Esquema de /v1/submissions confirmado en producción (201 accepted
-con una entrega real). Ver docs/api.md del SDK del profesor para filtros;
-el contrato de submissions vive en el openapi.json del servidor.
+0.7.1). Esquema de /v1/submissions confirmado en producción.
 
 Flujo (no reintenta a ciegas; reutiliza idempotency-key; 404 = salida en verde):
-    sync -> get_current_cycle -> receipt_exists? -> load_champion ->
-    predict -> validate -> submit -> save_receipt
+    get_current_cycle -> receipt_exists? -> load_champion ->
+    predict -> doble verificación -> validate -> submit -> save_receipt
+
+El modelo es un bundle: un regresor por estación, con el horizonte como
+feature. Las features se construyen con la misma función que se usó al
+entrenar (src.features), de modo que no puede reaparecer el train/serve skew.
 """
 
 from __future__ import annotations
@@ -17,14 +19,13 @@ import json
 import os
 from pathlib import Path
 
-import httpx
 import joblib
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from pulso_transmi import PulsoTransmiClient
 
-from src.features import FEATURE_COLUMNS, build_features
+from src.data import fetch_all_observations
+from src.features import FEATURE_COLUMNS, build_serving_design
 from src.http_utils import request_with_retry
 
 load_dotenv()
@@ -48,31 +49,30 @@ def get_current_cycle() -> dict:
     return response.json()
 
 
-def load_champion():
-    """Carga el modelo champion: metadata desde Supabase, artefacto desde
-    Supabase Storage (descargado solo si no está ya en este runner). Los
-    runners de Actions empiezan en limpio en cada corrida (guía metodológica
-    p.13), así que nunca asumimos que el .joblib ya existe localmente.
+def load_champion() -> tuple[dict, dict]:
+    """Bundle del champion: metadata desde Supabase, artefacto desde Storage.
+
+    Los runners de Actions empiezan en limpio, así que nunca se asume que el
+    .joblib ya está en disco (ver el paso de caché en infer.yml).
     """
     from src import db
 
     champion = db.get_champion()
     if champion is None:
-        raise RuntimeError("No hay modelo champion registrado. Corre train.py y promuévelo primero.")
+        raise RuntimeError("No hay modelo champion registrado. Corre train.py primero.")
 
     local_path = Path("artifacts") / f"{champion['version']}.joblib"
     if not local_path.exists():
         db.download_model_artifact(f"{champion['version']}.joblib", local_path)
-    model = joblib.load(local_path)
-    return model, champion
+    return joblib.load(local_path), champion
 
 
 def receipt_exists(cycle_id: str, model_version: str) -> bool:
     from src import db
 
-    client = db.get_client()
     result = (
-        client.table("predictions")
+        db.get_client()
+        .table("predictions")
         .select("id")
         .eq("cycle_id", cycle_id)
         .eq("model_version", model_version)
@@ -82,99 +82,67 @@ def receipt_exists(cycle_id: str, model_version: str) -> bool:
     return bool(result.data)
 
 
-def fetch_all_observations() -> pd.DataFrame:
-    """Histórico estático (/v1/observations) + incremental liberado
-    (/v1/stream/observations). El primero se congela en el corte inicial del
-    dataset; los datos de la ventana competitiva solo llegan por el stream
-    (confirmado en producción: /v1/observations no incluye nada después de
-    history_end aunque el ciclo pida un data_cutoff mucho más reciente).
-    """
-    with PulsoTransmiClient() as client:
-        static_obs = client.observations_dataframe()
+def targets_to_frame(targets: list[dict]) -> pd.DataFrame:
+    """Targets del ciclo -> DataFrame con el horizonte en pasos de 15 min."""
+    frame = pd.DataFrame(targets)
+    frame["station_id"] = frame["station_id"].astype("string")
+    frame["target_at"] = pd.to_datetime(frame["target_at"], utc=True)
+    frame["horizon"] = (frame["horizon_minutes"] // 15).astype(int)
+    return frame[["station_id", "target_at", "horizon"]]
 
-    headers = {"Authorization": f"Bearer {PULSO_API_KEY}"} if PULSO_API_KEY else {}
-    cursor = None
-    stream_frames = []
-    while True:
-        params = {"limit": 5000}
-        if cursor:
-            params["cursor"] = cursor
-        response = request_with_retry(
-            "GET", f"{PULSO_API_URL}/v1/stream/observations", params=params, headers=headers, timeout=45
+
+def predict_bundle(bundle: dict, design: pd.DataFrame) -> np.ndarray:
+    modelos = bundle["models"]
+    salida = np.zeros(len(design))
+    for station_id, grupo in design.groupby("station_id", observed=True):
+        modelo = modelos.get(str(station_id))
+        if modelo is None:
+            raise RuntimeError(f"El bundle no tiene modelo para la estación {station_id}.")
+        salida[design.index.get_indexer(grupo.index)] = modelo.predict(grupo[FEATURE_COLUMNS])
+    return np.clip(salida, 0, None)
+
+
+def double_check_predictions(bundle: dict, design: pd.DataFrame) -> np.ndarray:
+    """Dos inferencias sobre el mismo batch antes de enviar nada."""
+    primera = predict_bundle(bundle, design)
+    segunda = predict_bundle(bundle, design)
+    if not np.allclose(primera, segunda):
+        raise RuntimeError(
+            "Doble verificación falló: dos inferencias sobre el mismo batch "
+            "dieron resultados distintos. Se aborta el envío."
         )
-        response.raise_for_status()
-        page = response.json()
-        if page["data"]:
-            stream_frames.append(pd.DataFrame(page["data"]))
-        cursor = page.get("next_cursor")
-        if cursor is None:
-            break
-
-    if stream_frames:
-        stream_df = pd.concat(stream_frames, ignore_index=True)
-        stream_df["observed_at"] = pd.to_datetime(stream_df["observed_at"], utc=True)
-        stream_df["station_id"] = stream_df["station_id"].astype("string")
-        stream_df = stream_df[["station_id", "observed_at", "demand"]]
-        return pd.concat([static_obs, stream_df], ignore_index=True).drop_duplicates(
-            subset=["station_id", "observed_at"]
-        )
-    return static_obs
+    return primera
 
 
-def build_features_as_of(data_cutoff: str, targets: list[dict]) -> pd.DataFrame:
-    """Última fila de features conocida por estación (lags fijos al cutoff,
-    calendario tomado del target_at futuro). Ver README para su limitación
-    conocida (mismo bloque de lags para los 4 horizontes) y cómo mejorarla.
-    """
-    cutoff_ts = pd.Timestamp(data_cutoff)
+def build_batch(cycle: dict, bundle: dict) -> pd.DataFrame:
+    targets = targets_to_frame(cycle["targets"])
     observations = fetch_all_observations()
-    observations = observations[observations["observed_at"] <= cutoff_ts]
+    observations = observations[observations["observed_at"] <= pd.Timestamp(cycle["data_cutoff"])]
 
-    features_df = build_features(observations)
-    latest = features_df.sort_values("observed_at").groupby("station_id").tail(1).set_index("station_id")
-
-    rows = []
-    for target in targets:
-        station_id, target_at = target["station_id"], target["target_at"]
-        base = latest.loc[station_id]
-        row = {col: base[col] for col in FEATURE_COLUMNS if col not in ("hour", "minute", "dayofweek", "is_weekend")}
-        target_ts = pd.Timestamp(target_at)
-        row.update(
-            {
-                "station_id": station_id,
-                "target_at": target_at,
-                "hour": target_ts.hour,
-                "minute": target_ts.minute,
-                "dayofweek": target_ts.dayofweek,
-                "is_weekend": int(target_ts.dayofweek in (5, 6)),
-            }
+    design = build_serving_design(observations, targets).reset_index(drop=True)
+    faltantes = design[FEATURE_COLUMNS].isna().any(axis=1)
+    if faltantes.any():
+        # Sin historial suficiente para esa estación: se rellena con el último
+        # valor conocido en vez de enviar un hueco (un target ausente puntúa 0).
+        design.loc[faltantes, FEATURE_COLUMNS] = design.loc[faltantes, FEATURE_COLUMNS].fillna(
+            design[FEATURE_COLUMNS].median()
         )
-        rows.append(row)
-    return pd.DataFrame(rows)
+
+    design["value"] = double_check_predictions(bundle, design)
+    design = design.rename(columns={"observed_at": "target_at"})
+    return design[["station_id", "target_at", "horizon", "value"]]
 
 
 def validate_exact_targets(predictions: pd.DataFrame, targets: list[dict]) -> None:
-    expected = {(t["station_id"], t["target_at"]) for t in targets}
-    got = set(zip(predictions["station_id"], predictions["target_at"].astype(str)))
-    if got != expected:
-        raise ValueError(f"El batch no coincide con los targets solicitados. faltan={expected - got} extra={got - expected}")
+    esperados = {(t["station_id"], pd.Timestamp(t["target_at"])) for t in targets}
+    obtenidos = set(zip(predictions["station_id"], predictions["target_at"]))
+    if obtenidos != esperados:
+        raise ValueError(
+            f"El batch no coincide con los targets. faltan={esperados - obtenidos} "
+            f"extra={obtenidos - esperados}"
+        )
     if predictions["value"].isna().any() or (predictions["value"] < 0).any():
         raise ValueError("Hay predicciones nulas o negativas.")
-
-
-def double_check_predictions(model, features_df: pd.DataFrame) -> np.ndarray:
-    """Corre la inferencia dos veces sobre las mismas filas antes de enviar
-    nada. Si no coinciden exactamente, algo no es determinista (entorno,
-    features mutadas a mitad de camino) y no se debe confiar en el batch.
-    """
-    first = model.predict(features_df[FEATURE_COLUMNS])
-    second = model.predict(features_df[FEATURE_COLUMNS])
-    if not np.allclose(first, second):
-        raise RuntimeError(
-            "Doble verificación falló: dos inferencias sobre el mismo batch dieron "
-            "resultados distintos. Se aborta el envío por seguridad."
-        )
-    return first
 
 
 def stable_key(cycle_id: str, model_version: str, predictions: pd.DataFrame) -> str:
@@ -182,7 +150,8 @@ def stable_key(cycle_id: str, model_version: str, predictions: pd.DataFrame) -> 
         {
             "cycle_id": cycle_id,
             "model_version": model_version,
-            "predictions": predictions.sort_values(["station_id", "target_at"]).to_dict(orient="records"),
+            "predictions": predictions.sort_values(["station_id", "target_at"])
+            .to_dict(orient="records"),
         },
         sort_keys=True,
         default=str,
@@ -193,11 +162,8 @@ def stable_key(cycle_id: str, model_version: str, predictions: pd.DataFrame) -> 
 def submit_predictions(
     cycle_id: str, data_cutoff: str, predictions: pd.DataFrame, idempotency_key: str, champion: dict
 ) -> dict:
-    """POST /v1/submissions (esquema confirmado en producción: 201 accepted).
-
-    client_run_id (body) e Idempotency-Key (header) usan la misma llave: para
-    el mismo ciclo y contenido, un reintento de red reutiliza la llave en vez
-    de crear una entrega nueva (regla de la guía operativa p.5).
+    """POST /v1/submissions. client_run_id e Idempotency-Key comparten llave:
+    un reintento tras falla transitoria reutiliza la entrega en vez de crear otra.
     """
     payload = {
         "schema_version": "1.0",
@@ -211,13 +177,15 @@ def submit_predictions(
             "git_commit": champion.get("commit_sha"),
         },
         "predictions": [
-            {"station_id": row["station_id"], "target_at": row["target_at"], "value": float(row["value"])}
-            for row in predictions.to_dict(orient="records")
+            {
+                "station_id": fila["station_id"],
+                "target_at": pd.Timestamp(fila["target_at"]).isoformat().replace("+00:00", "Z"),
+                "value": float(fila["value"]),
+            }
+            for fila in predictions.to_dict(orient="records")
         ],
     }
     headers = {"Authorization": f"Bearer {PULSO_API_KEY}", "Idempotency-Key": idempotency_key}
-    # Seguro reintentar: la misma Idempotency-Key hace que un reintento tras
-    # una falla transitoria reutilice la entrega en vez de crear otra.
     response = request_with_retry(
         "POST", f"{PULSO_API_URL}/v1/submissions", json=payload, headers=headers, timeout=45
     )
@@ -225,23 +193,27 @@ def submit_predictions(
     return response.json()
 
 
-def save_receipt(cycle_id: str, model_version: str, predictions: pd.DataFrame, submission_id: str, idempotency_key: str) -> None:
+def save_receipt(
+    cycle_id: str, model_version: str, predictions: pd.DataFrame,
+    submission_id: str, idempotency_key: str,
+) -> None:
     from src import db
 
-    client = db.get_client()
     records = [
         {
             "cycle_id": cycle_id,
-            "station_id": row["station_id"],
-            "target_at": row["target_at"],
+            "station_id": fila["station_id"],
+            "target_at": pd.Timestamp(fila["target_at"]).isoformat(),
             "model_version": model_version,
-            "value": row["value"],
+            "value": float(fila["value"]),
             "submission_id": submission_id,
             "idempotency_key": idempotency_key,
         }
-        for row in predictions.to_dict(orient="records")
+        for fila in predictions.to_dict(orient="records")
     ]
-    client.table("predictions").upsert(records, on_conflict="cycle_id,station_id,target_at,model_version").execute()
+    db.upsert_in_chunks(
+        "predictions", records, on_conflict="cycle_id,station_id,target_at,model_version"
+    )
 
 
 def run() -> None:
@@ -251,22 +223,21 @@ def run() -> None:
         print("No hay ciclo abierto (404 no_open_cycle). Fin en verde.")
         return
 
-    model, champion = load_champion()
+    bundle, champion = load_champion()
     if receipt_exists(cycle["cycle_id"], champion["version"]):
         print(f"Ciclo {cycle['cycle_id']} ya tiene recibo con {champion['version']}. Fin.")
         return
 
-    features_df = build_features_as_of(cycle["data_cutoff"], cycle["targets"])
-    features_df["value"] = double_check_predictions(model, features_df)
-    validate_exact_targets(features_df, cycle["targets"])
+    batch = build_batch(cycle, bundle)
+    validate_exact_targets(batch, cycle["targets"])
 
-    key = stable_key(cycle["cycle_id"], champion["version"], features_df)
-    receipt = submit_predictions(cycle["cycle_id"], cycle["data_cutoff"], features_df, key, champion)
-    save_receipt(cycle["cycle_id"], champion["version"], features_df, receipt["submission_id"], key)
+    key = stable_key(cycle["cycle_id"], champion["version"], batch)
+    recibo = submit_predictions(cycle["cycle_id"], cycle["data_cutoff"], batch, key, champion)
+    save_receipt(cycle["cycle_id"], champion["version"], batch, recibo["submission_id"], key)
     print(
         f"Entregado ciclo {cycle['cycle_id']} con {champion['version']}: "
-        f"{receipt['predictions_received']}/{receipt['expected_predictions']} predicciones, "
-        f"status={receipt['status']}."
+        f"{recibo['predictions_received']}/{recibo['expected_predictions']} predicciones, "
+        f"status={recibo['status']}."
     )
 
 

@@ -109,11 +109,54 @@ nulos, negativos, cobertura por estación) antes de escribir.
 python -m src.train
 ```
 
-Usa partición **temporal** (últimos 7 días como validación, nunca aleatoria).
-Compara el candidato (RandomForest) contra dos baselines (naive 24h y
-estacional 7 días) y guarda el artefacto en `artifacts/` + metadata JSON.
-Si hay credenciales de Supabase, registra la versión en `model_versions`
-como `candidate`.
+Usa partición **temporal** (validación cruzada de 2 pliegues, nunca aleatoria),
+compara contra dos baselines (repetir 24h antes / 7 días antes), corre una
+doble verificación de determinismo y solo promueve si el **peor** pliegue
+supera al champion vigente.
+
+## Cómo se llegó al modelo actual (evidencia)
+
+Todas las cifras son la métrica oficial (WAPE→accuracy por estación,
+promediada), evaluadas sobre **el mismo conjunto** y los **4 horizontes**.
+Los scripts están en [`experiments/`](experiments/).
+
+| Configuración | Accuracy | Artefactos |
+|---|---|---|
+| Producción inicial (1 modelo, lags congelados) | 79.24% | 45 MB |
+| + un modelo por horizonte | 84.60% | — |
+| + estación como feature | 85.83% | — |
+| + un modelo por estación | 86.64% | 282 MB |
+| + ensamble RF/boosting | 86.74% | ~2 GB |
+| **Actual: 12 modelos por estación, boosting MAE** | **86.69%** | **4.8 MB** |
+
+### El hallazgo principal: train/serve skew
+
+La versión inicial entrenaba con "el lag más reciente = 15 min antes del
+target", pero al servir el horizonte +60 ese mismo lag tenía 60 minutos de
+antigüedad. El costo era brutal y crecía con la distancia:
+
+| Horizonte | Antes | Ahora |
+|---|---|---|
+| +15 min | 85.9% | 86.9% |
+| +30 min | 82.8% | 86.9% |
+| +45 min | 77.3% | 86.8% |
+| +60 min | **70.9%** | **86.2%** |
+
+`src/features.py` lo resuelve nombrando las features por su posición relativa
+al target (`s0` = "la observación más reciente disponible"), de modo que
+entrenamiento e inferencia usan exactamente la misma construcción.
+`tests/test_features.py` tiene una prueba de regresión que falla si alguien
+vuelve a congelar los lags.
+
+### Qué se probó y no sirvió
+
+- **Contexto (clima/eventos)**: 85.27% vs 85.83% sin él. Solo cubre el periodo
+  estático, así que imputarlo para la ventana competitiva mete ruido.
+- **RF más profundo / features más ricas**: diferencias dentro del ruido.
+- **Ensamble RF+boosting**: +0.05 puntos por 400x más peso. No compensa.
+
+El techo observado está en ~87%; parece ser el piso de ruido del generador
+sintético, no una limitación del pipeline.
 
 ### 5. Pruebas
 
