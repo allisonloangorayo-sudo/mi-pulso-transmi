@@ -1,0 +1,35 @@
+name: pulso-transmi-drift
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 */2 * * *"   # cada 2 horas
+
+permissions:
+  contents: read
+  actions: write   # necesario para disparar train.yml automáticamente
+
+concurrency:
+  group: pulso-transmi-drift
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Calcular accuracy/drift y disparar reentrenamiento si cae >=5 pts
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python -m src.drift

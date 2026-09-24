@@ -1,19 +1,18 @@
-name: pulso-transmi-predict
+name: pulso-transmi-collector
 
 on:
   workflow_dispatch:
-  # Actívalo solo cuando el profesor publique la frecuencia (guía operativa: cada 10 min).
-  # schedule:
-  #   - cron: "*/10 * * * *"
+  schedule:
+    - cron: "5 * * * *"   # cada hora, minuto 5
 
 concurrency:
-  group: pulso-transmi-predict
+  group: pulso-transmi-collector
   cancel-in-progress: false
 
 jobs:
-  predict:
+  collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -24,12 +23,9 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Sincronizar e inferir (si hay ciclo abierto)
+      - name: Sincronizar histórico/incremental a Supabase (idempotente)
         env:
           PULSO_API_URL: ${{ vars.PULSO_API_URL }}
-          PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: |
-          python -m src.ingest
-          python -m src.predict
+        run: python -m src.ingest

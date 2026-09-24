@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import timedelta
+from pathlib import Path
 
 import httpx
 import joblib
@@ -47,29 +47,21 @@ def get_current_cycle() -> dict:
 
 
 def load_champion():
-    """Carga el modelo champion desde Supabase (model_versions.status='champion').
-
-    TODO: cuando se implemente el paso 4 (promoción), el artefacto debe
-    descargarse desde Supabase Storage o GitHub Release en vez de asumir que
-    ya está presente en el filesystem del runner (los runners de Actions
-    empiezan en limpio, ver guía metodológica p.13).
+    """Carga el modelo champion: metadata desde Supabase, artefacto desde
+    Supabase Storage (descargado solo si no está ya en este runner). Los
+    runners de Actions empiezan en limpio en cada corrida (guía metodológica
+    p.13), así que nunca asumimos que el .joblib ya existe localmente.
     """
     from src import db
 
-    client = db.get_client()
-    result = (
-        client.table("model_versions")
-        .select("*")
-        .eq("status", "champion")
-        .order("trained_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    rows = result.data or []
-    if not rows:
+    champion = db.get_champion()
+    if champion is None:
         raise RuntimeError("No hay modelo champion registrado. Corre train.py y promuévelo primero.")
-    champion = rows[0]
-    model = joblib.load(champion["artifact_path"])
+
+    local_path = Path("artifacts") / f"{champion['version']}.joblib"
+    if not local_path.exists():
+        db.download_model_artifact(f"{champion['version']}.joblib", local_path)
+    model = joblib.load(local_path)
     return model, champion
 
 

@@ -1,0 +1,32 @@
+name: pulso-transmi-infer
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 * * * *"   # cada hora, 10 min después del collector
+
+concurrency:
+  group: pulso-transmi-infer
+  cancel-in-progress: false
+
+jobs:
+  infer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Generar 48 predicciones (12 estaciones x 4 horizontes) y evaluarlas
+        env:
+          PULSO_API_URL: ${{ vars.PULSO_API_URL }}
+          PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python -m src.infer

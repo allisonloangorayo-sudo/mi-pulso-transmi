@@ -89,3 +89,23 @@ create table if not exists evaluations (
     abs_error double precision generated always as (abs(predicted - real)) stored,
     evaluated_at timestamptz not null default now()
 );
+
+-- Estado genérico del pipeline (ej. el "reloj" simulado que usa src/infer.py
+-- mientras la API no libera ciclos reales). Una fila por clave.
+create table if not exists pipeline_state (
+    key text primary key,
+    value jsonb,
+    updated_at timestamptz not null default now()
+);
+
+-- Resultados de cada corrida de detección de drift (accuracy acumulada vs.
+-- rolling 24h y si esa corrida disparó un reentrenamiento automático).
+create table if not exists drift_metrics (
+    id bigint generated always as identity primary key,
+    computed_at timestamptz not null default now(),
+    sample_size integer not null,
+    accuracy_overall double precision,
+    accuracy_rolling_24h double precision,
+    drop_pct double precision,
+    triggered_retrain boolean not null default false
+);

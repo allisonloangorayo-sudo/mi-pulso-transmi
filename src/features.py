@@ -28,7 +28,10 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     grouped = df.groupby("station_id")["demand"]
     for lag in LAG_STEPS:
         df[f"lag_{lag}"] = grouped.shift(lag)
-    df["rolling_mean_4"] = grouped.shift(1).rolling(4).mean().reset_index(level=0, drop=True)
+    # OJO: sin .reset_index() — shift() ya devuelve un índice alineado con df;
+    # aplicar reset_index(level=0) aquí desalinea silenciosamente las filas
+    # cuando df fue reordenado o filtrado (bug real detectado y corregido).
+    df["rolling_mean_4"] = grouped.shift(1).rolling(4).mean()
     return df
 
 

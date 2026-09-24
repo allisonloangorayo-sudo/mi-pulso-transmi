@@ -132,16 +132,28 @@ def run() -> None:
     from src import db
 
     try:
+        remote_path = db.upload_model_artifact(artifact_path, f"{version}.joblib")
+        print(f"Subido a Supabase Storage: {remote_path}")
         db.register_model_version(
             version=version,
             data_cutoff=train_df["observed_at"].max(),
-            artifact_path=str(artifact_path),
+            artifact_path=remote_path,
             commit_sha=metadata["commit_sha"],
             features=FEATURE_COLUMNS,
             validation_metric=candidate_score,
             status="candidate",
         )
         print("Registrado en Supabase (model_versions, status=candidate).")
+
+        promoted = db.promote_if_better(version, candidate_score)
+        if promoted:
+            print(f"PROMOVIDO a champion: {version} (accuracy {candidate_score:.2f}).")
+        else:
+            champion = db.get_champion()
+            print(
+                f"No promovido: el champion vigente ({champion['version']}, "
+                f"{champion['validation_metric']:.2f}) sigue siendo mejor o igual."
+            )
     except db.SupabaseNotConfigured:
         print("SUPABASE_URL/SUPABASE_KEY no configurados: modelo guardado solo localmente.")
 

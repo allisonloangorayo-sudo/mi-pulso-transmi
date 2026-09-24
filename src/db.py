@@ -13,6 +13,7 @@ import math
 import os
 from datetime import datetime
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
@@ -139,6 +140,100 @@ def log_ingestion_run(
             "error_message": error_message,
         }
     ).execute()
+
+
+MODEL_BUCKET = "models"
+
+
+def ensure_model_bucket() -> None:
+    client = get_client()
+    try:
+        client.storage.create_bucket(MODEL_BUCKET, options={"public": False})
+    except Exception as exc:  # noqa: BLE001 - "ya existe" no es un error real
+        if "already exists" not in str(exc).lower() and "duplicate" not in str(exc).lower():
+            raise
+
+
+def upload_model_artifact(local_path: str | Path, remote_name: str) -> str:
+    """Sube el .joblib a Supabase Storage. Necesario porque cada corrida de
+    GitHub Actions empieza en un runner limpio: sin esto, train.yml guarda el
+    modelo pero infer.yml (en otra ejecución) nunca podría encontrarlo.
+    """
+    ensure_model_bucket()
+    client = get_client()
+    client.storage.from_(MODEL_BUCKET).upload(
+        remote_name,
+        str(local_path),
+        file_options={"upsert": "true", "content-type": "application/octet-stream"},
+    )
+    return f"{MODEL_BUCKET}/{remote_name}"
+
+
+def download_model_artifact(remote_name: str, local_path: str | Path) -> Path:
+    client = get_client()
+    data = client.storage.from_(MODEL_BUCKET).download(remote_name)
+    path = Path(local_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
+def get_state(key: str) -> Any | None:
+    client = get_client()
+    result = client.table("pipeline_state").select("value").eq("key", key).execute()
+    rows = result.data or []
+    return rows[0]["value"] if rows else None
+
+
+def set_state(key: str, value: Any) -> None:
+    client = get_client()
+    client.table("pipeline_state").upsert(
+        {"key": key, "value": _json_safe(value), "updated_at": datetime.utcnow().isoformat()},
+        on_conflict="key",
+    ).execute()
+
+
+def get_champion() -> dict[str, Any] | None:
+    client = get_client()
+    result = (
+        client.table("model_versions")
+        .select("*")
+        .eq("status", "champion")
+        .order("trained_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    rows = result.data or []
+    return rows[0] if rows else None
+
+
+def promote_if_better(version: str, validation_metric: float) -> bool:
+    """Promueve `version` a champion solo si supera al champion vigente.
+
+    Regla de la guía: "una nueva versión reemplaza al champion únicamente si
+    supera los criterios de validación... la novedad por sí sola no es una
+    mejora". Si no hay champion todavía, el primer candidato válido lo es.
+    """
+    client = get_client()
+    champion = get_champion()
+    if champion is not None and validation_metric <= champion["validation_metric"]:
+        return False
+    if champion is not None:
+        client.table("model_versions").update({"status": "historical"}).eq("version", champion["version"]).execute()
+    client.table("model_versions").update({"status": "champion"}).eq("version", version).execute()
+    return True
+
+
+def insert_evaluations(records: list[dict[str, Any]]) -> None:
+    if not records:
+        return
+    client = get_client()
+    client.table("evaluations").insert([{k: _json_safe(v) for k, v in r.items()} for r in records]).execute()
+
+
+def insert_drift_metric(record: dict[str, Any]) -> None:
+    client = get_client()
+    client.table("drift_metrics").insert({k: _json_safe(v) for k, v in record.items()}).execute()
 
 
 def register_model_version(
