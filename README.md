@@ -41,7 +41,7 @@ supabase/schema.sql   # DDL de la memoria operacional (9 tablas)
 .github/workflows/
 ├── collector.yml  # cada hora: sincroniza datos a Supabase
 ├── infer.yml      # cada hora: 48 predicciones (12 estaciones x 4 horizontes)
-├── drift.yml      # cada 2 horas: accuracy/drift; dispara train.yml si cae ≥5 pts
+├── drift.yml      # cada hora: accuracy/drift; dispara train.yml si cae ≥5 pts
 └── train.yml      # manual + disparado automáticamente por drift.yml
 ```
 
@@ -51,7 +51,7 @@ supabase/schema.sql   # DDL de la memoria operacional (9 tablas)
 |---|---|---|
 | `collector.yml` | cada hora | Descarga y sincroniza a Supabase (idempotente). Hoy el histórico es estático, así que cada corrida re-sincroniza lo mismo — inofensivo por el upsert, y queda listo para cuando la API empiece a liberar datos nuevos de verdad. |
 | `infer.yml` | cada hora | Genera 48 predicciones (12 estaciones × 4 horizontes: +15/+30/+45/+60 min) con el champion vigente y las evalúa. |
-| `drift.yml` | cada 2 horas | Calcula accuracy acumulada vs. rolling 24h y la guarda en `drift_metrics`. Si la caída llega a **5 puntos**, dispara `train.yml` automáticamente (`gh workflow run`). |
+| `drift.yml` | cada hora | Calcula accuracy acumulada vs. rolling 24h y la guarda en `drift_metrics`. Si la caída llega a **5 puntos**, dispara `train.yml` automáticamente (`gh workflow run`). |
 | `train.yml` | manual + automático (por drift) | Entrena un candidato, lo compara contra el champion vigente y **lo promueve automáticamente si lo supera** (nunca si no). |
 
 Con el histórico estático de hoy, la caída de accuracy debería mantenerse

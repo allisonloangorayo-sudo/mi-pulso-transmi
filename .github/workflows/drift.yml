@@ -3,7 +3,7 @@ name: pulso-transmi-drift
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 */2 * * *"   # cada 2 horas
+    - cron: "45 * * * *"   # cada hora, 30 min después del collector/infer
 
 permissions:
   contents: read
