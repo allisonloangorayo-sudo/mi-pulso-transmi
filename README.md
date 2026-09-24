@@ -155,6 +155,48 @@ gh secret set PULSO_API_KEY --body "..."
 GitHub automáticamente — no hay que crearlo. Nunca subas las claves de
 arriba al código ni las imprimas en logs.
 
+### El `schedule:` nativo no funcionó — disparo externo
+
+El `schedule:` de GitHub Actions **nunca se disparó** en este repositorio
+(verificado con `GET /actions/runs?event=schedule` → `total_count: 0` durante
+más de 2 horas, con los workflows en estado `active`, Actions habilitado,
+cron válido en la rama por defecto y tras forzar un `disable`/`enable`).
+Es una falla conocida del scheduler de GitHub con workflows recién creados
+cuyo cron se edita varias veces seguidas.
+
+Solución en producción: **cron-job.org** llama al endpoint
+`POST /repos/{owner}/{repo}/actions/workflows/{id}/dispatches` de la API de
+GitHub con un token fine-grained (permiso *Actions: read and write*, alcance
+limitado a este repo):
+
+| Job externo | Cadencia | Workflow disparado |
+|---|---|---|
+| `pulso-transmi-collector` | minutos `:00 :10 :20 :30 :40 :50` | `collector.yml` |
+| `pulso-transmi-infer` | minutos `:05 :15 :25 :35 :45 :55` | `infer.yml` |
+| `pulso-transmi-drift` | minuto `:50` de cada hora | `drift.yml` |
+
+Los `schedule:` nativos se dejaron declarados en los YAML por si GitHub los
+reactiva; un disparo doble es inofensivo porque los workflows son
+idempotentes (`receipt_exists`, upsert por llave primaria).
+
+## Dashboard (bono)
+
+`dashboard/` es una app Next.js desplegada en Vercel:
+**https://mi-pulso-transmi-dashboard.vercel.app**
+
+Lee Supabase y el leaderboard oficial **solo desde el servidor** (la ruta
+`app/api/dashboard/route.ts`), así la `service_role` key y la `PULSO_API_KEY`
+nunca llegan al navegador — requisito explícito de la guía. Paneles:
+accuracy acumulada vs. rolling 24h, mapa 3D de accuracy por estación×ciclo,
+accuracy por estación, y el estado de la última corrida de cada workflow.
+
+```bash
+cd dashboard
+npm install
+cp .env.local.example .env.local   # completar con las claves
+npm run dev
+```
+
 ## Estado de la ventana competitiva
 
 - [x] `submit_predictions()` implementado contra el endpoint real (`POST
