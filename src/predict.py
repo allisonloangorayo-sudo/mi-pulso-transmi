@@ -19,6 +19,7 @@ from pathlib import Path
 
 import httpx
 import joblib
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from pulso_transmi import PulsoTransmiClient
@@ -161,6 +162,21 @@ def validate_exact_targets(predictions: pd.DataFrame, targets: list[dict]) -> No
         raise ValueError("Hay predicciones nulas o negativas.")
 
 
+def double_check_predictions(model, features_df: pd.DataFrame) -> np.ndarray:
+    """Corre la inferencia dos veces sobre las mismas filas antes de enviar
+    nada. Si no coinciden exactamente, algo no es determinista (entorno,
+    features mutadas a mitad de camino) y no se debe confiar en el batch.
+    """
+    first = model.predict(features_df[FEATURE_COLUMNS])
+    second = model.predict(features_df[FEATURE_COLUMNS])
+    if not np.allclose(first, second):
+        raise RuntimeError(
+            "Doble verificación falló: dos inferencias sobre el mismo batch dieron "
+            "resultados distintos. Se aborta el envío por seguridad."
+        )
+    return first
+
+
 def stable_key(cycle_id: str, model_version: str, predictions: pd.DataFrame) -> str:
     payload = json.dumps(
         {
@@ -241,7 +257,7 @@ def run() -> None:
         return
 
     features_df = build_features_as_of(cycle["data_cutoff"], cycle["targets"])
-    features_df["value"] = model.predict(features_df[FEATURE_COLUMNS])
+    features_df["value"] = double_check_predictions(model, features_df)
     validate_exact_targets(features_df, cycle["targets"])
 
     key = stable_key(cycle["cycle_id"], champion["version"], features_df)

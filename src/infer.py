@@ -26,7 +26,7 @@ from pulso_transmi import PulsoTransmiClient
 
 from src import db
 from src.features import FEATURE_COLUMNS, build_features
-from src.predict import NoOpenCycle, get_current_cycle, load_champion
+from src.predict import NoOpenCycle, double_check_predictions, get_current_cycle, load_champion
 
 load_dotenv()
 
@@ -89,7 +89,7 @@ def run_simulated_cycle() -> None:
         return
 
     model, champion = load_champion()
-    batch["value"] = np.clip(model.predict(batch[FEATURE_COLUMNS]), 0, None)
+    batch["value"] = np.clip(double_check_predictions(model, batch), 0, None)
 
     cycle_id = f"sim-{next_cutoff.isoformat()}"
     pred_records = [

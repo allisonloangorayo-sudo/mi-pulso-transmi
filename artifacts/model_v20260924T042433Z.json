@@ -1,0 +1,39 @@
+{
+  "version": "v20260924T042433Z",
+  "trained_at": "2026-09-24T04:24:33.805201+00:00",
+  "data_cutoff": "2026-09-09 04:45:00+00:00",
+  "commit_sha": "24c40be7b5c23ac938fdadc986c69faf734d3c36",
+  "features": [
+    "hour",
+    "minute",
+    "dayofweek",
+    "is_weekend",
+    "lag_1",
+    "lag_4",
+    "lag_96",
+    "lag_672",
+    "rolling_mean_4"
+  ],
+  "cross_validation": [
+    {
+      "fold": 0,
+      "baseline_scores": {
+        "naive_24h": 77.89082515102594,
+        "seasonal_7d": 83.11229696661745
+      },
+      "candidate_score": 86.51326676135825,
+      "beats_baseline": true
+    },
+    {
+      "fold": 1,
+      "baseline_scores": {
+        "naive_24h": 76.82922444489988,
+        "seasonal_7d": 83.02268984388749
+      },
+      "candidate_score": 85.94870783969391,
+      "beats_baseline": true
+    }
+  ],
+  "validation_metric": 85.94870783969391,
+  "artifact_path": "artifacts/model_v20260924T042433Z.joblib"
+}
