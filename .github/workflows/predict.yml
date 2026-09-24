@@ -1,0 +1,35 @@
+name: pulso-transmi-predict
+
+on:
+  workflow_dispatch:
+  # Actívalo solo cuando el profesor publique la frecuencia (guía operativa: cada 10 min).
+  # schedule:
+  #   - cron: "*/10 * * * *"
+
+concurrency:
+  group: pulso-transmi-predict
+  cancel-in-progress: false
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Sincronizar e inferir (si hay ciclo abierto)
+        env:
+          PULSO_API_URL: ${{ vars.PULSO_API_URL }}
+          PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python -m src.ingest
+          python -m src.predict

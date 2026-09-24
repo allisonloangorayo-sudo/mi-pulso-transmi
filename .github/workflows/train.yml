@@ -1,0 +1,36 @@
+name: pulso-transmi-train
+
+on:
+  workflow_dispatch:
+  # Programación opcional (ej. diaria); actívala cuando el equipo lo decida.
+  # schedule:
+  #   - cron: "0 6 * * *"
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - run: pytest -q
+
+      - name: Entrenar candidato y registrar métricas
+        env:
+          PULSO_API_URL: ${{ vars.PULSO_API_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python -m src.train
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: artifacts/
+          retention-days: 30

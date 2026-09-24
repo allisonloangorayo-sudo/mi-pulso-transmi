@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/
+artifacts/*.pkl
+artifacts/*.joblib
+artifacts/eda/
+.pytest_cache/
+.DS_Store
