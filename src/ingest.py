@@ -14,12 +14,12 @@ from __future__ import annotations
 import os
 import sys
 
-import httpx
 import pandas as pd
 from dotenv import load_dotenv
 from pulso_transmi import PulsoTransmiClient
 
 from src import db
+from src.http_utils import request_with_retry
 
 load_dotenv()
 
@@ -65,7 +65,9 @@ def sync_stream() -> int:
         params = {"limit": 5000}
         if cursor:
             params["cursor"] = cursor
-        response = httpx.get(f"{PULSO_API_URL}/v1/stream/observations", params=params, headers=headers, timeout=45)
+        response = request_with_retry(
+            "GET", f"{PULSO_API_URL}/v1/stream/observations", params=params, headers=headers, timeout=45
+        )
         response.raise_for_status()
         page = response.json()
         if page["data"]:

@@ -23,7 +23,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from pulso_transmi import PulsoTransmiClient
 
-from src.features import FEATURE_COLUMNS, add_calendar_features, build_features
+from src.features import FEATURE_COLUMNS, build_features
+from src.http_utils import request_with_retry
 
 load_dotenv()
 
@@ -37,7 +38,9 @@ class NoOpenCycle(Exception):
 
 def get_current_cycle() -> dict:
     headers = {"Authorization": f"Bearer {PULSO_API_KEY}"} if PULSO_API_KEY else {}
-    response = httpx.get(f"{PULSO_API_URL}/v1/forecast-cycles/current", headers=headers, timeout=30)
+    response = request_with_retry(
+        "GET", f"{PULSO_API_URL}/v1/forecast-cycles/current", headers=headers, timeout=30
+    )
     if response.status_code == 404:
         raise NoOpenCycle
     response.raise_for_status()
@@ -95,7 +98,9 @@ def fetch_all_observations() -> pd.DataFrame:
         params = {"limit": 5000}
         if cursor:
             params["cursor"] = cursor
-        response = httpx.get(f"{PULSO_API_URL}/v1/stream/observations", params=params, headers=headers, timeout=45)
+        response = request_with_retry(
+            "GET", f"{PULSO_API_URL}/v1/stream/observations", params=params, headers=headers, timeout=45
+        )
         response.raise_for_status()
         page = response.json()
         if page["data"]:
@@ -195,7 +200,11 @@ def submit_predictions(
         ],
     }
     headers = {"Authorization": f"Bearer {PULSO_API_KEY}", "Idempotency-Key": idempotency_key}
-    response = httpx.post(f"{PULSO_API_URL}/v1/submissions", json=payload, headers=headers, timeout=45)
+    # Seguro reintentar: la misma Idempotency-Key hace que un reintento tras
+    # una falla transitoria reutilice la entrega en vez de crear otra.
+    response = request_with_retry(
+        "POST", f"{PULSO_API_URL}/v1/submissions", json=payload, headers=headers, timeout=45
+    )
     response.raise_for_status()
     return response.json()
 
