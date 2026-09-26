@@ -57,3 +57,39 @@ quedarse con 12 modelos.
 
 **Conclusión (y configuración adoptada)**: empata con el mejor ensamble
 (86.74%) pesando 99% menos. Comprimido en disco quedan 4.8 MB.
+
+## `04_recencia_y_tuning.py`
+
+Siete variantes sobre datos actuales, todas dentro de 0.17 puntos
+(85.11% – 85.28%): ponderación por recencia (medias vidas de 7, 14 y 21
+días), más iteraciones con learning rate menor, más hojas con
+regularización, y calibración por estación estimada sobre histórico.
+
+**Conclusión**: ninguna mejora; el modelo está en su techo con este enfoque.
+
+## `05_calibracion_con_feedback.py`
+
+Motivación: sobre 2.400 evaluaciones reales el modelo predice solo el 94.7%
+de la demanda observada (0.825 en la estación 09122). El sesgo aparece en
+todas las versiones del modelo, así que parece estructural: entrenar con
+pérdida MAE apunta a la mediana, y con demanda sesgada a la derecha la
+mediana queda por debajo de la media.
+
+El backtest agregado (sin fuga, calibrando cada ciclo solo con evaluaciones
+anteriores) daba **+0.33 puntos** con calibración por estación sobre los
+últimos 12 ciclos.
+
+**Pero el análisis pareado por ciclo lo desmiente**: mejora media de
+**−0.559 puntos**, solo 23 de 45 ciclos mejoran (51%, una moneda al aire),
+t = −1.38. El +0.33 era un artefacto de agrupar la métrica sobre todos los
+ciclos a la vez, no una mejora real.
+
+**Conclusión: descartada.** Queda documentada porque el resultado agregado
+era engañoso y valía la pena dejar registrado por qué no se implementó.
+
+## Nota sobre el margen con los punteros
+
+La accuracy real por ciclo tiene media 82.73 y desviación 2.40 sobre 49
+ciclos, así que el error estándar de la media es 0.34 puntos. La diferencia
+con el primer lugar (0.49 puntos) son 1.4 errores estándar: estadísticamente
+no se distingue de un empate.
