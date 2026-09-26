@@ -221,12 +221,15 @@ def run() -> None:
         cycle = get_current_cycle()
     except NoOpenCycle:
         print("No hay ciclo abierto (404 no_open_cycle). Fin en verde.")
-        return
+        return {"mode": "sin_ciclo", "status": "ok"}
 
     bundle, champion = load_champion()
     if receipt_exists(cycle["cycle_id"], champion["version"]):
         print(f"Ciclo {cycle['cycle_id']} ya tiene recibo con {champion['version']}. Fin.")
-        return
+        return {
+            "mode": "real", "status": "skipped", "cycle_id": cycle["cycle_id"],
+            "data_cutoff": cycle["data_cutoff"], "model_version": champion["version"],
+        }
 
     batch = build_batch(cycle, bundle)
     validate_exact_targets(batch, cycle["targets"])
@@ -239,6 +242,12 @@ def run() -> None:
         f"{recibo['predictions_received']}/{recibo['expected_predictions']} predicciones, "
         f"status={recibo['status']}."
     )
+    return {
+        "mode": "real", "status": "ok", "cycle_id": cycle["cycle_id"],
+        "data_cutoff": cycle["data_cutoff"], "model_version": champion["version"],
+        "predictions_count": int(recibo["predictions_received"]),
+        "submission_id": recibo["submission_id"],
+    }
 
 
 if __name__ == "__main__":

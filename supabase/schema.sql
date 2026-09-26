@@ -98,6 +98,27 @@ create table if not exists pipeline_state (
     updated_at timestamptz not null default now()
 );
 
+-- Bitácora de cada ejecución de src/infer.py: qué hizo, con qué modelo y
+-- cómo terminó. `ingestion_runs` cubre al collector; esta cubre la
+-- inferencia, que antes no dejaba rastro salvo en los logs de Actions.
+create table if not exists inference_runs (
+    id bigint generated always as identity primary key,
+    run_at timestamptz not null default now(),
+    github_run_id text,                    -- identificador de la ejecución en Actions
+    mode text not null                     -- qué camino tomó la corrida
+        check (mode in ('real', 'simulado', 'sin_ciclo')),
+    cycle_id text,
+    data_cutoff timestamptz,               -- hasta dónde vio datos el predictor
+    model_version text,
+    predictions_count integer not null default 0,
+    submission_id text,                    -- recibo de la API, si hubo envío
+    status text not null check (status in ('ok', 'skipped', 'error')),
+    error_message text,
+    duration_ms integer
+);
+
+create index if not exists idx_inference_runs_run_at on inference_runs (run_at desc);
+
 -- Resultados de cada corrida de detección de drift (accuracy acumulada vs.
 -- rolling 24h y si esa corrida disparó un reentrenamiento automático).
 create table if not exists drift_metrics (

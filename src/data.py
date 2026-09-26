@@ -9,6 +9,7 @@ esta función vive aquí y no duplicada en cada módulo.
 from __future__ import annotations
 
 import os
+import sys
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -24,6 +25,13 @@ PULSO_API_KEY = os.getenv("PULSO_API_KEY")
 
 def fetch_stream_observations() -> pd.DataFrame:
     if not PULSO_API_KEY:
+        # Silenciar esto costó caro una vez: train.yml corría sin la key y
+        # entrenaba solo con el histórico estático sin que nadie lo notara.
+        print(
+            "AVISO: PULSO_API_KEY ausente. Se omite /v1/stream/observations, "
+            "así que NO se verán los datos de la ventana competitiva.",
+            file=sys.stderr,
+        )
         return pd.DataFrame(columns=["station_id", "observed_at", "demand"])
 
     headers = {"Authorization": f"Bearer {PULSO_API_KEY}"}

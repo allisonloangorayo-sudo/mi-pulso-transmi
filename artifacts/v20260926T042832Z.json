@@ -1,0 +1,54 @@
+{
+  "version": "v20260926T042832Z",
+  "trained_at": "2026-09-26T04:28:33.288018+00:00",
+  "data_cutoff": "2026-09-13 17:30:00+00:00",
+  "commit_sha": "ee1d74a205c155fbfe487f7fc5fe38c649fb034b",
+  "features": [
+    "s0",
+    "s1",
+    "s2",
+    "s3",
+    "s4",
+    "s8",
+    "sday",
+    "sday2",
+    "sday_prev",
+    "sday_next",
+    "sweek",
+    "sweek2",
+    "roll4",
+    "roll16",
+    "roll96",
+    "std16",
+    "trend",
+    "day_delta",
+    "hour",
+    "minute",
+    "dow",
+    "is_weekend",
+    "tod",
+    "horizon"
+  ],
+  "cross_validation": [
+    {
+      "fold": 0,
+      "baseline_scores": {
+        "naive_24h": 68.78093254952412,
+        "seasonal_7d": 74.07725550857602
+      },
+      "candidate_score": 85.20437866585453,
+      "beats_baseline": true
+    },
+    {
+      "fold": 1,
+      "baseline_scores": {
+        "naive_24h": 66.56148725071047,
+        "seasonal_7d": 73.53345894113454
+      },
+      "candidate_score": 87.15513271434803,
+      "beats_baseline": true
+    }
+  ],
+  "validation_metric": 85.20437866585453,
+  "artifact_mb": 4.82
+}

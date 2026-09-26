@@ -25,6 +25,10 @@ jobs:
       - name: Entrenar candidato y registrar métricas
         env:
           PULSO_API_URL: ${{ vars.PULSO_API_URL }}
+          # Sin esta key, fetch_all_observations() no puede leer
+          # /v1/stream/observations y el modelo se entrenaría solo con el
+          # histórico estático, ignorando todos los datos de la competencia.
+          PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python -m src.train

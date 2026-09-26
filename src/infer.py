@@ -12,6 +12,7 @@ Dos modos, elegidos automáticamente:
 
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 
 import pandas as pd
@@ -106,22 +107,44 @@ def run_simulated_cycle() -> None:
         f"[simulación] {cycle_id}: {len(pred_records)} predicciones "
         f"({len(evaluaciones)} evaluadas) con {champion['version']}."
     )
+    return {
+        "mode": "simulado", "status": "ok", "cycle_id": cycle_id,
+        "data_cutoff": cutoff, "model_version": champion["version"],
+        "predictions_count": len(pred_records),
+    }
 
 
 def run() -> None:
+    inicio = time.monotonic()
+    resultado: dict = {"mode": "sin_ciclo", "status": "error"}
     try:
-        cycle = get_current_cycle()
-    except NoOpenCycle:
-        cycle = None
+        try:
+            cycle = get_current_cycle()
+        except NoOpenCycle:
+            cycle = None
 
-    if cycle is not None:
-        print(f"Ciclo real detectado ({cycle.get('cycle_id')}); delego en src.predict.")
-        from src.predict import run as run_real
+        if cycle is not None:
+            print(f"Ciclo real detectado ({cycle.get('cycle_id')}); delego en src.predict.")
+            from src.predict import run as run_real
 
-        run_real()
-        return
-
-    run_simulated_cycle()
+            resultado = run_real() or {"mode": "real", "status": "ok"}
+        else:
+            resultado = run_simulated_cycle() or {"mode": "simulado", "status": "ok"}
+    except Exception as exc:  # noqa: BLE001 - se registra y se relanza
+        resultado = {**resultado, "status": "error", "error_message": f"{type(exc).__name__}: {exc}"}
+        raise
+    finally:
+        db.log_inference_run(
+            mode=resultado.get("mode", "sin_ciclo"),
+            status=resultado.get("status", "error"),
+            cycle_id=resultado.get("cycle_id"),
+            data_cutoff=resultado.get("data_cutoff"),
+            model_version=resultado.get("model_version"),
+            predictions_count=resultado.get("predictions_count", 0),
+            submission_id=resultado.get("submission_id"),
+            error_message=resultado.get("error_message"),
+            duration_ms=int((time.monotonic() - inicio) * 1000),
+        )
 
 
 if __name__ == "__main__":

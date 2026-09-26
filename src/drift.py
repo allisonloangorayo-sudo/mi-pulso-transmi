@@ -1,10 +1,22 @@
 """Detección de drift: accuracy acumulada vs. rolling 24h.
 
 Si la caída (acumulada − rolling 24h) alcanza DROP_THRESHOLD_PCT, dispara
-automáticamente el workflow de reentrenamiento (train.yml) vía `gh workflow
-run`. Mientras el histórico sea estático, esta caída se mantiene cerca de 0
-la mayor parte del tiempo (no hay drift real todavía) — el disparo solo
-debería activarse cuando los datos empiecen a cambiar de verdad.
+automáticamente el reentrenamiento (train.yml) vía `gh workflow run`.
+
+Por qué 5 puntos, y por qué sobre el promedio móvil y no sobre un lote
+suelto. Medido sobre 174 lotes evaluados de este proyecto:
+
+    accuracy por lote: media 88.90, desviación 3.85 (p5 = 85.19, min = 66.21)
+
+- Sobre **un lote suelto**, 5 puntos son apenas 1.3 desviaciones: ocurre por
+  puro azar con frecuencia, así que ahí el umbral produciría falsas alarmas.
+- Sobre el **promedio móvil de 24 h** (que es lo que se compara aquí), el
+  error estándar cae a 3.85/√24 ≈ 0.79, así que 5 puntos son ~6 desviaciones:
+  prácticamente imposible por azar.
+
+Es decir: el umbral es conservador por diseño. Prefiere no reentrenar de más
+antes que reaccionar a ruido. Si se quisiera detectar antes, 2.5 puntos (≈3σ
+del promedio móvil) sigue siendo estadísticamente defendible.
 """
 
 from __future__ import annotations
@@ -20,7 +32,7 @@ from src import db
 
 load_dotenv()
 
-DROP_THRESHOLD_PCT = 5.0
+DROP_THRESHOLD_PCT = float(os.getenv("DRIFT_DROP_THRESHOLD_PCT", "5.0"))
 MIN_SAMPLE_SIZE = 48  # al menos un ciclo (12 estaciones x 4 horizontes) evaluado
 
 
@@ -29,8 +41,7 @@ def _accuracy(frame: pd.DataFrame) -> float:
 
 
 def compute_and_store() -> dict:
-    client = db.get_client()
-    rows = client.table("evaluations").select("*").execute().data or []
+    rows = db.fetch_all_rows("evaluations", "station_id,predicted,real,abs_error,evaluated_at")
     if len(rows) < MIN_SAMPLE_SIZE:
         print(f"Solo {len(rows)} evaluaciones (mínimo {MIN_SAMPLE_SIZE}); aún no hay señal de drift confiable.")
         return {}

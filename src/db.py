@@ -178,6 +178,30 @@ def download_model_artifact(remote_name: str, local_path: str | Path) -> Path:
     return path
 
 
+def fetch_all_rows(
+    table: str, columns: str = "*", *, page_size: int = 1000, max_rows: int = 200_000
+) -> list[dict[str, Any]]:
+    """Lee una tabla completa paginando.
+
+    PostgREST devuelve como máximo 1000 filas por petición. Sin paginar, un
+    `select("*")` sobre una tabla grande devuelve un subconjunto arbitrario
+    en silencio — lo que hacía que el cálculo de drift usara solo 1000 de
+    8.352 evaluaciones.
+    """
+    client = get_client()
+    filas: list[dict[str, Any]] = []
+    offset = 0
+    while offset < max_rows:
+        page = client.table(table).select(columns).range(offset, offset + page_size - 1).execute().data
+        if not page:
+            break
+        filas.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return filas
+
+
 def get_state(key: str) -> Any | None:
     client = get_client()
     result = client.table("pipeline_state").select("value").eq("key", key).execute()
@@ -207,20 +231,31 @@ def get_champion() -> dict[str, Any] | None:
     return rows[0] if rows else None
 
 
-def promote_if_better(version: str, validation_metric: float) -> bool:
-    """Promueve `version` a champion solo si supera al champion vigente.
-
-    Regla de la guía: "una nueva versión reemplaza al champion únicamente si
-    supera los criterios de validación... la novedad por sí sola no es una
-    mejora". Si no hay champion todavía, el primer candidato válido lo es.
-    """
+def promote(version: str) -> None:
+    """Marca `version` como champion y jubila al anterior."""
     client = get_client()
+    champion = get_champion()
+    if champion is not None:
+        client.table("model_versions").update({"status": "historical"}).eq(
+            "version", champion["version"]
+        ).execute()
+    client.table("model_versions").update({"status": "champion"}).eq("version", version).execute()
+
+
+def promote_if_better(version: str, validation_metric: float) -> bool:
+    """Promoción por métrica guardada. OJO: solo es válida cuando no hay
+    champion previo.
+
+    Comparar la métrica de un candidato contra la métrica *guardada* del
+    champion es engañoso: cada una se calculó sobre una ventana temporal
+    distinta, y unas ventanas son más difíciles que otras. Para decidir entre
+    dos modelos hay que evaluarlos sobre la MISMA ventana — eso lo hace
+    `src.train.duel_against_champion`.
+    """
     champion = get_champion()
     if champion is not None and validation_metric <= champion["validation_metric"]:
         return False
-    if champion is not None:
-        client.table("model_versions").update({"status": "historical"}).eq("version", champion["version"]).execute()
-    client.table("model_versions").update({"status": "champion"}).eq("version", version).execute()
+    promote(version)
     return True
 
 
@@ -234,6 +269,40 @@ def insert_evaluations(records: list[dict[str, Any]]) -> None:
 def insert_drift_metric(record: dict[str, Any]) -> None:
     client = get_client()
     client.table("drift_metrics").insert({k: _json_safe(v) for k, v in record.items()}).execute()
+
+
+def log_inference_run(
+    mode: str,
+    status: str,
+    *,
+    cycle_id: str | None = None,
+    data_cutoff: Any = None,
+    model_version: str | None = None,
+    predictions_count: int = 0,
+    submission_id: str | None = None,
+    error_message: str | None = None,
+    duration_ms: int | None = None,
+) -> None:
+    """Bitácora de una ejecución de inferencia.
+
+    Nunca debe tumbar la corrida: si el registro falla, se avisa y se sigue,
+    porque perder la bitácora es menos grave que perder la entrega del ciclo.
+    """
+    try:
+        get_client().table("inference_runs").insert({
+            "github_run_id": os.getenv("GITHUB_RUN_ID"),
+            "mode": mode,
+            "status": status,
+            "cycle_id": cycle_id,
+            "data_cutoff": _json_safe(data_cutoff),
+            "model_version": model_version,
+            "predictions_count": predictions_count,
+            "submission_id": submission_id,
+            "error_message": error_message[:2000] if error_message else None,
+            "duration_ms": duration_ms,
+        }).execute()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Aviso: no se pudo registrar la corrida en inference_runs ({exc}).")
 
 
 def register_model_version(

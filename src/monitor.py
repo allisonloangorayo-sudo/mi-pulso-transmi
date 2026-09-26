@@ -41,9 +41,7 @@ def offline_backtest_report() -> pd.Series:
 def accuracy_from_evaluations() -> dict:
     from src import db
 
-    client = db.get_client()
-    result = client.table("evaluations").select("*").execute()
-    rows = result.data or []
+    rows = db.fetch_all_rows("evaluations", "station_id,predicted,real,abs_error,evaluated_at")
     if not rows:
         print("Sin evaluaciones todavía (no hay submissions reales evaluadas).")
         return {}

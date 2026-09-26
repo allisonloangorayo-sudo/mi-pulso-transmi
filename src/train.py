@@ -143,6 +143,48 @@ def cross_validate(design: pd.DataFrame) -> list[dict]:
     return resultados
 
 
+MIN_FILAS_DUELO = 2000
+
+
+def duel_against_champion(design: pd.DataFrame, champion: dict) -> tuple[float, float] | None:
+    """Compara candidato y champion sobre la MISMA ventana.
+
+    Por qué existe: la métrica guardada de cada modelo se calculó sobre una
+    ventana temporal distinta, y unas ventanas son más difíciles que otras
+    (medido: la misma configuración da 86.7% en una semana y 85.2% en la
+    siguiente). Comparar esos números sueltos haría que un modelo entrenado
+    con datos más frescos pierda solo porque le tocó una ventana difícil, y
+    el champion se quedaría congelado para siempre.
+
+    La ventana del duelo es todo lo posterior al corte de datos del champion,
+    así que ninguno de los dos la vio al entrenar. Devuelve None si todavía
+    no hay suficientes datos nuevos para juzgar.
+    """
+    corte_champion = pd.Timestamp(champion["data_cutoff"])
+    holdout = design[design["observed_at"] > corte_champion]
+    if len(holdout) < MIN_FILAS_DUELO:
+        print(f"Solo {len(holdout)} filas posteriores al champion "
+              f"(mínimo {MIN_FILAS_DUELO}): no hay con qué comparar todavía.")
+        return None
+
+    entrenamiento = design[design["observed_at"] <= corte_champion]
+    retador = train_bundle(entrenamiento)
+    holdout = holdout.reset_index(drop=True)
+    score_retador = official_accuracy(holdout.assign(prediction=predict_bundle(retador, holdout)))
+
+    from src.predict import load_champion, predict_bundle as predict_champion
+
+    bundle_champion, _ = load_champion()
+    score_champion = official_accuracy(
+        holdout.assign(prediction=predict_champion(bundle_champion, holdout))
+    )
+
+    print(f"\nDuelo sobre {len(holdout):,} filas posteriores a {corte_champion}:")
+    print(f"  champion {champion['version']}: {score_champion:.2f}")
+    print(f"  candidato:                     {score_retador:.2f}")
+    return score_retador, score_champion
+
+
 def double_check(modelos: dict, design: pd.DataFrame) -> None:
     """Dos inferencias sobre las mismas filas deben coincidir exactamente."""
     muestra = design.head(2000).reset_index(drop=True)
@@ -225,12 +267,27 @@ def run() -> None:
         )
         print("Registrado en Supabase (status=candidate).")
 
-        if db.promote_if_better(version, peor):
-            print(f"PROMOVIDO a champion: {version} (peor pliegue {peor:.2f}).")
+        champion = db.get_champion()
+        if champion is None:
+            db.promote(version)
+            print(f"PROMOVIDO a champion (era el primero): {version}.")
+            return
+
+        duelo = duel_against_champion(design, champion)
+        if duelo is None:
+            # Sin datos nuevos suficientes, no se toca al champion: la novedad
+            # por sí sola no es una mejora.
+            print("No promovido: falta evidencia nueva para comparar.")
+            return
+
+        score_retador, score_champion = duelo
+        if score_retador > score_champion:
+            db.promote(version)
+            print(f"PROMOVIDO a champion: {version} "
+                  f"({score_retador:.2f} vs {score_champion:.2f} del anterior).")
         else:
-            champion = db.get_champion()
-            print(f"No promovido: champion vigente {champion['version']} "
-                  f"({champion['validation_metric']:.2f}) sigue mejor o igual.")
+            print(f"No promovido: el champion {champion['version']} sigue mejor "
+                  f"({score_champion:.2f} vs {score_retador:.2f}) en la misma ventana.")
     except db.SupabaseNotConfigured:
         print("SUPABASE_URL/SUPABASE_KEY no configurados: modelo solo local.")
 
