@@ -30,3 +30,14 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python -m src.ingest
+
+      # Los datos que acaban de llegar resuelven targets que predijimos antes.
+      # Sin este paso las predicciones reales nunca se evaluaban y el drift
+      # solo veía lotes simulados sobre historia ya conocida.
+      - name: Evaluar predicciones reales ya resueltas
+        env:
+          PULSO_API_URL: ${{ vars.PULSO_API_URL }}
+          PULSO_API_KEY: ${{ secrets.PULSO_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python -m src.evaluate

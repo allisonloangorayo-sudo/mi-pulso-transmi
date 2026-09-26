@@ -78,6 +78,11 @@ create table if not exists predictions (
 );
 
 -- Evaluaciones: predicción vs. realidad, una vez se conoce el dato real.
+--
+-- `source` importa para el drift: las evaluaciones 'simulado' replican
+-- historia que el modelo ya conoce y dan una lectura optimista; solo las
+-- 'real' reflejan el desempeño en la competencia. Mezclarlas escondía la
+-- degradación real.
 create table if not exists evaluations (
     id bigint generated always as identity primary key,
     prediction_id bigint references predictions(id),
@@ -87,8 +92,13 @@ create table if not exists evaluations (
     predicted double precision not null,
     real double precision not null,
     abs_error double precision generated always as (abs(predicted - real)) stored,
-    evaluated_at timestamptz not null default now()
+    source text not null default 'simulado' check (source in ('real', 'simulado')),
+    cycle_id text,
+    evaluated_at timestamptz not null default now(),
+    unique (station_id, target_at, model_version, source)
 );
+
+create index if not exists idx_evaluations_source on evaluations (source, evaluated_at desc);
 
 -- Estado genérico del pipeline (ej. el "reloj" simulado que usa src/infer.py
 -- mientras la API no libera ciclos reales). Una fila por clave.
