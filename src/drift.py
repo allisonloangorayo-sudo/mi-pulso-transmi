@@ -12,7 +12,10 @@ reentrenamiento (train.yml) si ocurre cualquiera de estas cosas:
    promedio diluye a una sola estación rota: 05100 llegó a 7.4% de accuracy
    y el promedio solo marcaba 4.5 pts de caída, por debajo del umbral
    anterior de 5, así que nunca se reentrenó.
-3. El champion está viejo: su corte de datos quedó más de MAX_STALENESS_H
+3. Piso absoluto: la accuracy de los últimos 6 ciclos (la misma ventana de
+   la tabla "últimos 6 ciclos" del portal) queda por debajo de
+   ACCURACY_FLOOR_PCT (80%), aunque no haya una caída brusca.
+4. El champion está viejo: su corte de datos quedó más de MAX_STALENESS_H
    horas (virtuales) detrás del dato más reciente. Medido en la ventana
    competitiva: reentrenar a diario vale +1.5 pts frente a un modelo fijo, y
    cada 6 h otros +0.35 (83.81 → 84.16).
@@ -37,6 +40,8 @@ load_dotenv()
 
 DROP_THRESHOLD_PCT = float(os.getenv("DRIFT_DROP_THRESHOLD_PCT", "3.0"))
 CRITICAL_DROP_PCT = float(os.getenv("DRIFT_CRITICAL_DROP_PCT", "5.0"))
+ACCURACY_FLOOR_PCT = float(os.getenv("DRIFT_ACCURACY_FLOOR_PCT", "80.0"))
+FLOOR_WINDOW_CYCLES = 6  # igual que la tabla "últimos 6 ciclos" del portal
 STATION_DROP_PCT = float(os.getenv("DRIFT_STATION_DROP_PCT", "10.0"))
 MAX_STALENESS_H = float(os.getenv("DRIFT_MAX_STALENESS_H", "6"))
 COOLDOWN_H = float(os.getenv("DRIFT_COOLDOWN_H", "2"))
@@ -66,7 +71,7 @@ def _load_evaluations() -> tuple[pd.DataFrame, str]:
     reentrenamientos escondería la degradación de verdad.
     """
     filas = db.fetch_all_rows(
-        "evaluations", "station_id,predicted,real,abs_error,evaluated_at,model_version,source"
+        "evaluations", "station_id,predicted,real,abs_error,evaluated_at,model_version,source,cycle_id"
     )
     df = pd.DataFrame(filas)
     if df.empty:
@@ -169,7 +174,15 @@ def compute_and_store() -> dict:
     caida_estacion = (ref_estacion - por_estacion).where(muestras >= MIN_STATION_SAMPLE).dropna()
     rotas = caida_estacion[caida_estacion >= STATION_DROP_PCT].sort_values(ascending=False)
 
-    # Señal 4: champion viejo.
+    # Señal 4: piso absoluto sobre los últimos 6 ciclos.
+    ultimos_ciclos = None
+    if "cycle_id" in df.columns and df["cycle_id"].notna().any():
+        ciclos = sorted(df["cycle_id"].dropna().unique())[-FLOOR_WINDOW_CYCLES:]
+        ventana = df[df["cycle_id"].isin(ciclos)]
+        if len(ventana) >= MIN_SAMPLE_SIZE:
+            ultimos_ciclos = _accuracy(ventana)
+
+    # Señal 5: champion viejo.
     antiguedad = _staleness_hours()
 
     motivos = []
@@ -178,6 +191,9 @@ def compute_and_store() -> dict:
         motivos.append(f"caída {nivel} de {caida:.2f} pts (umbral {DROP_THRESHOLD_PCT})")
     if not rotas.empty:
         motivos.append("estaciones degradadas: " + ", ".join(f"{s} −{v:.1f}" for s, v in rotas.items()))
+    if ultimos_ciclos is not None and ultimos_ciclos < ACCURACY_FLOOR_PCT:
+        motivos.append(f"accuracy de los últimos {FLOOR_WINDOW_CYCLES} ciclos {ultimos_ciclos:.2f} "
+                       f"< piso de {ACCURACY_FLOOR_PCT:.0f}")
     if antiguedad is not None and antiguedad > MAX_STALENESS_H:
         motivos.append(f"champion con {antiguedad:.0f} h sin datos nuevos (máx {MAX_STALENESS_H:.0f})")
 
@@ -192,6 +208,8 @@ def compute_and_store() -> dict:
         print(f"  referencia {referencia:.2f} | caída contra ella {caida_referencia:.2f} pts")
     else:
         print("  sin línea base del champion todavía (necesita más evaluaciones suyas)")
+    if ultimos_ciclos is not None:
+        print(f"  últimos {FLOOR_WINDOW_CYCLES} ciclos {ultimos_ciclos:.2f} (piso {ACCURACY_FLOOR_PCT:.0f})")
     if antiguedad is not None:
         print(f"  antigüedad del champion: {antiguedad:.1f} h")
     print("  accuracy 24h por estación (vs referencia):")
@@ -220,7 +238,7 @@ def compute_and_store() -> dict:
     return {
         "overall": overall, "rolling_24h": rolling, "reference": referencia,
         "drop_pct": caida, "triggered": triggered, "source": origen,
-        "reasons": motivos, "stations_degraded": list(rotas.index),
+        "last_cycles": ultimos_ciclos, "reasons": motivos, "stations_degraded": list(rotas.index),
     }
 
 
