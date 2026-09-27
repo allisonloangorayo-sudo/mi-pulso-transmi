@@ -111,6 +111,10 @@ Cada escala gana en estaciones distintas, por eso el promedio supera a todas.
 Reentrenar a diario frente a un modelo fijo valió +1.5 pts con el modelo
 anterior (81.04 → 82.52).
 
+Control en una ventana estable (4 al 9-sep, sin cambios de nivel, reentreno
+diario): por estación 87.16% vs ensamble 87.17%. Empatan: la ganancia viene
+de adaptarse a los cambios de nivel, sin costo cuando no los hay.
+
 **Conclusión: adoptado** (`src/model.py`).
 
 ## Nota sobre el margen con los punteros
