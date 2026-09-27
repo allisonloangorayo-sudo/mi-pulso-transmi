@@ -42,9 +42,18 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python -m src.infer
 
+      # Se queda solo con el modelo más reciente (el champion recién
+      # descargado). Antes se tomaba el primero en orden alfabético, que era el
+      # viejo restaurado de la caché: la caché quedó atascada en
+      # v20260924T055040Z y cada corrida volvía a descargar el champion.
       - name: Identificar la versión en disco
         id: modelo
-        run: echo "version=$(ls artifacts/*.joblib 2>/dev/null | head -1 | xargs -r basename)" >> "$GITHUB_OUTPUT"
+        run: |
+          reciente=$(ls -t artifacts/*.joblib 2>/dev/null | head -1)
+          if [ -n "$reciente" ]; then
+            find artifacts -name '*.joblib' ! -path "$reciente" -delete
+            echo "version=$(basename "$reciente")" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Guardar modelo en caché
         if: steps.modelo.outputs.version != ''
