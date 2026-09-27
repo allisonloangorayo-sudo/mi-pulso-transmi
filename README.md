@@ -60,7 +60,7 @@ supabase/schema.sql   # DDL de la memoria operacional (9 tablas)
 |---|---|---|
 | `collector.yml` | cada 10 min | Sincroniza histórico + stream incremental a Supabase (idempotente). |
 | `infer.yml` | cada 10 min | Si hay ciclo real abierto: genera 48 predicciones y las envía a `/v1/submissions`. Si no: simula sobre el histórico para seguir midiendo accuracy/drift. |
-| `drift.yml` | cada hora | Revisa al champion sobre evaluaciones reales (acumulada, rolling 24h, referencia y accuracy por estación) y lo guarda en `drift_metrics`. Dispara `train.yml` si la caída llega a **3 puntos** (alerta; ≥5 crítica), si una estación cae ≥10 puntos o si el champion lleva más de 24 h sin datos nuevos. |
+| `drift.yml` | cada hora | Revisa al champion sobre evaluaciones reales (acumulada, rolling 24h, referencia y accuracy por estación) y lo guarda en `drift_metrics`. Dispara `train.yml` si la caída llega a **3 puntos** (alerta; ≥5 crítica), si una estación cae ≥10 puntos o si el champion lleva más de 6 h (virtuales) sin datos nuevos. |
 | `train.yml` | manual + automático (por drift) | Entrena un candidato, lo compara contra el champion vigente y **lo promueve automáticamente si lo supera** (nunca si no). |
 
 `collector.yml` e `infer.yml` corren cada 10 minutos porque los ciclos reales
@@ -132,7 +132,8 @@ backtest que replica los ciclos reales del 11 al 15-sep):
 | Por estación, demanda cruda (anterior) | 82.48% |
 | Global + ratios de nivel | 83.14% |
 | Global normalizado por `roll96` | 83.61% |
-| **Ensamble global normalizado (`roll96`, `roll16`, `exp_w`)** | **83.81%** |
+| Ensamble global normalizado (`roll96`, `roll16`, `exp_w`) | 83.81% |
+| **Ensamble + reentreno cada 6 h** | **84.16%** |
 
 - Features de nivel: ratios de lo reciente contra la misma ventana ayer y
   hace una semana (`lvl*`) y una expectativa adaptativa (`exp_w` = demanda

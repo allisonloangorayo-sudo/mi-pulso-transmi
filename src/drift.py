@@ -13,8 +13,9 @@ reentrenamiento (train.yml) si ocurre cualquiera de estas cosas:
    y el promedio solo marcaba 4.5 pts de caída, por debajo del umbral
    anterior de 5, así que nunca se reentrenó.
 3. El champion está viejo: su corte de datos quedó más de MAX_STALENESS_H
-   horas (virtuales) detrás del dato más reciente. Reentrenar a diario vale
-   +1.5 pts medidos en la ventana competitiva frente a un modelo fijo.
+   horas (virtuales) detrás del dato más reciente. Medido en la ventana
+   competitiva: reentrenar a diario vale +1.5 pts frente a un modelo fijo, y
+   cada 6 h otros +0.35 (83.81 → 84.16).
 
 Para no disparar cada hora mientras un reentrenamiento ya está en curso (o
 cuando el candidato no logró superar al champion), hay un enfriamiento de
@@ -37,7 +38,7 @@ load_dotenv()
 DROP_THRESHOLD_PCT = float(os.getenv("DRIFT_DROP_THRESHOLD_PCT", "3.0"))
 CRITICAL_DROP_PCT = float(os.getenv("DRIFT_CRITICAL_DROP_PCT", "5.0"))
 STATION_DROP_PCT = float(os.getenv("DRIFT_STATION_DROP_PCT", "10.0"))
-MAX_STALENESS_H = float(os.getenv("DRIFT_MAX_STALENESS_H", "24"))
+MAX_STALENESS_H = float(os.getenv("DRIFT_MAX_STALENESS_H", "6"))
 COOLDOWN_H = float(os.getenv("DRIFT_COOLDOWN_H", "2"))
 MIN_SAMPLE_SIZE = 48  # al menos un ciclo (12 estaciones x 4 horizontes) evaluado
 MIN_STATION_SAMPLE = 24  # 6 ciclos por estación antes de juzgarla sola

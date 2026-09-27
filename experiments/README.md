@@ -105,6 +105,7 @@ h1..h4), 11-sep 17:00 → 15-sep 04:00, reentreno diario:
 | Global normalizado `roll16` | 83.52% | 81.0 | 83.5 |
 | Global normalizado `exp_w` | 83.58% | 84.1 | 82.4 |
 | **Ensamble de las 3 escalas** | **83.81%** | 82.5 | 83.7 |
+| Ensamble, reentreno cada 6 h | 84.16% | 83.4 | 84.3 |
 
 Cada escala gana en estaciones distintas, por eso el promedio supera a todas.
 Reentrenar a diario frente a un modelo fijo valió +1.5 pts con el modelo
