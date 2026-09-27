@@ -33,24 +33,45 @@ async function fetchLeaderboard(): Promise<DashboardPayload["leaderboard"]> {
   }
 }
 
+// PostgREST corta en 1000 filas por petición sin avisar: con un solo
+// `.limit(5000)` el panel leía las 1000 evaluaciones MÁS VIEJAS y se quedó
+// congelado en el 24-sep. Se pagina desde lo más reciente.
+const MAX_EVALUATIONS = 5000;
+const PAGE = 1000;
+
+async function fetchRecentEvaluations(supabase: ReturnType<typeof getSupabaseServer>) {
+  const filas: EvaluationRow[] = [];
+  for (let offset = 0; offset < MAX_EVALUATIONS; offset += PAGE) {
+    const { data, error } = await supabase
+      .from("evaluations")
+      .select("station_id, predicted, real, abs_error, evaluated_at")
+      .eq("source", "real")
+      .order("evaluated_at", { ascending: false })
+      .range(offset, offset + PAGE - 1);
+    if (error) throw error;
+    filas.push(...((data ?? []) as EvaluationRow[]));
+    if (!data || data.length < PAGE) break;
+  }
+  return filas.reverse();
+}
+
 export async function GET() {
   try {
     const supabase = getSupabaseServer();
 
-    const [driftRes, evalRes, modelsRes, runsRes, predRes] = await Promise.all([
-      supabase.from("drift_metrics").select("*").order("computed_at", { ascending: true }).limit(500),
-      supabase
-        .from("evaluations")
-        .select("station_id, predicted, real, abs_error, evaluated_at")
-        .order("evaluated_at", { ascending: true })
-        .limit(5000),
+    const [driftRes, evaluations, modelsRes, runsRes, predRes] = await Promise.all([
+      supabase.from("drift_metrics").select("*").order("computed_at", { ascending: false }).limit(500),
+      fetchRecentEvaluations(supabase),
       supabase.from("model_versions").select("*").order("trained_at", { ascending: false }).limit(50),
       supabase.from("ingestion_runs").select("*").order("started_at", { ascending: false }).limit(30),
-      supabase.from("predictions").select("submitted_at").order("submitted_at", { ascending: false }).limit(1),
+      supabase
+        .from("predictions")
+        .select("submitted_at", { count: "exact" })
+        .order("submitted_at", { ascending: false })
+        .limit(1),
     ]);
 
-    const drift = driftRes.data ?? [];
-    const evaluations = (evalRes.data ?? []) as EvaluationRow[];
+    const drift = (driftRes.data ?? []).reverse();
     const models = modelsRes.data ?? [];
     const runs = runsRes.data ?? [];
 
@@ -122,7 +143,7 @@ export async function GET() {
       },
       totals: {
         evaluations: evaluations.length,
-        predictions: predRes.data ? predRes.count ?? 0 : 0,
+        predictions: predRes.count ?? 0,
         models: models.length,
       },
     };
