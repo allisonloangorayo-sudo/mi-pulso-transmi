@@ -3,6 +3,8 @@ import pytest
 
 from src.features import (
     FEATURE_COLUMNS,
+    LEVEL_COLUMNS,
+    RATIO_COLUMNS,
     HORIZONS,
     STEPS_PER_WEEK,
     build_design,
@@ -68,5 +70,18 @@ def test_serving_matches_training_for_the_same_instant(horizon):
     targets = pd.DataFrame([{"station_id": "A", "target_at": target, "horizon": horizon}])
     obtenido = build_serving_design(observations, targets).iloc[0]
 
-    for columna in FEATURE_COLUMNS:
+    for columna in FEATURE_COLUMNS + LEVEL_COLUMNS + RATIO_COLUMNS:
         assert obtenido[columna] == pytest.approx(esperado[columna]), columna
+
+
+def test_level_ratio_detects_a_level_shift():
+    """Si la demanda cae a la mitad, el ratio contra la semana pasada lo
+    refleja de inmediato (el caso de la estación 05100)."""
+    observations = _synthetic(stations=("A",))
+    observations["demand"] = 100
+    ultimos = observations.index[-16:]
+    observations.loc[ultimos, "demand"] = 50
+    design = build_design(observations, 1).dropna(subset=LEVEL_COLUMNS)
+    fila = design.iloc[-1]
+    assert fila["lvl4_w"] == pytest.approx(51 / 101)
+    assert fila["exp_w"] == pytest.approx(100 * fila["lvl16_w"])

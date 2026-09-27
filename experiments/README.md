@@ -87,6 +87,31 @@ ciclos a la vez, no una mejora real.
 **Conclusión: descartada.** Queda documentada porque el resultado agregado
 era engañoso y valía la pena dejar registrado por qué no se implementó.
 
+## `06_nivel_adaptativo.py`
+
+Motivación: el champion `v20260926T042832Z` rindió 76.5% real. Desglosado por
+estación, 05100 estaba en 7.4% (predecía ~1.9× la demanda): desde el 13-sep
+opera al ~40% de su nivel y el modelo seguía a `sday`/`sweek`. Sin 05100 el
+mismo modelo daba ~83%.
+
+Backtest que replica los ciclos reales (corte a la hora; :15/:30/:45/:00 =
+h1..h4), 11-sep 17:00 → 15-sep 04:00, reentreno diario:
+
+| Variante | Accuracy | 05100 | 07111 |
+|---|---|---|---|
+| Por estación, crudo (anterior) | 82.48% | 77.3 | 79.9 |
+| Global + ratios de nivel | 83.14% | 81.1 | 80.7 |
+| Global normalizado `roll96` | 83.61% | 81.5 | 83.9 |
+| Global normalizado `roll16` | 83.52% | 81.0 | 83.5 |
+| Global normalizado `exp_w` | 83.58% | 84.1 | 82.4 |
+| **Ensamble de las 3 escalas** | **83.81%** | 82.5 | 83.7 |
+
+Cada escala gana en estaciones distintas, por eso el promedio supera a todas.
+Reentrenar a diario frente a un modelo fijo valió +1.5 pts con el modelo
+anterior (81.04 → 82.52).
+
+**Conclusión: adoptado** (`src/model.py`).
+
 ## Nota sobre el margen con los punteros
 
 La accuracy real por ciclo tiene media 82.73 y desviación 2.40 sobre 49

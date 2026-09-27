@@ -37,6 +37,26 @@ CALENDAR = ["hour", "minute", "dow", "is_weekend", "tod"]
 
 FEATURE_COLUMNS = list(SLOT_OFFSETS) + ROLLING + DERIVED + CALENDAR + ["horizon"]
 
+# --- Features adaptativas al nivel (modelo global normalizado) ---------------
+#
+# El modelo por estación seguía a `sday`/`sweek` y a niveles absolutos. Cuando
+# la estación 05100 pasó a operar al ~40% de su demanda normal (13-sep, 14:00
+# virtual) siguió prediciendo el doble durante más de un día: 7.4% de accuracy
+# en esa estación y −6.5 puntos en el promedio. Un árbol no extrapola a
+# niveles que nunca vio.
+#
+# La corrección: comparar lo reciente contra la misma ventana ayer y hace una
+# semana (ratios `lvl*`), y expresar todo relativo a una escala de nivel
+# reciente. Así un corte o un desvío de demanda se ve en cuanto aparece.
+EPS = 1.0
+TARGET_LAGS = {"tday": STEPS_PER_DAY, "tweek": STEPS_PER_WEEK, "tweek2": 2 * STEPS_PER_WEEK}
+LEVEL_COLUMNS = (
+    list(SLOT_OFFSETS) + list(TARGET_LAGS) + ROLLING
+    + ["roll4_d", "roll16_d", "roll4_w", "roll16_w", "roll96_w", "exp_w", "exp_d"]
+)
+RATIO_COLUMNS = ["lvl4_d", "lvl4_w", "lvl16_d", "lvl16_w", "lvl96_w"]
+GLOBAL_FEATURES = LEVEL_COLUMNS + RATIO_COLUMNS + CALENDAR + ["horizon", "station_code"]
+
 
 def build_design(observations: pd.DataFrame, horizon: int) -> pd.DataFrame:
     """Matriz de diseño para un horizonte dado.
@@ -64,7 +84,38 @@ def build_design(observations: pd.DataFrame, horizon: int) -> pd.DataFrame:
     df["is_weekend"] = (df["dow"] >= 5).astype(int)
     df["tod"] = df["hour"] * STEPS_PER_HOUR + df["minute"] // 15
     df["horizon"] = horizon
+    _add_level_features(df, grouped, horizon)
     return df
+
+
+def _rolling_by_station(serie: pd.Series, station: pd.Series, window: int) -> pd.Series:
+    return serie.groupby(station).transform(lambda s: s.rolling(window).mean())
+
+
+def _add_level_features(df: pd.DataFrame, grouped, horizon: int) -> None:
+    # Demanda del mismo instante del target ayer / hace 1 y 2 semanas. Son
+    # rezagos >= 96 pasos, así que están disponibles para cualquier horizonte.
+    for columna, offset in TARGET_LAGS.items():
+        df[columna] = grouped.shift(offset)
+
+    for sufijo, offset in (("d", STEPS_PER_DAY), ("w", STEPS_PER_WEEK)):
+        pasado = grouped.shift(horizon + offset)
+        df[f"roll4_{sufijo}"] = _rolling_by_station(pasado, df["station_id"], 4)
+        df[f"roll16_{sufijo}"] = _rolling_by_station(pasado, df["station_id"], 16)
+    df["roll96_w"] = _rolling_by_station(
+        grouped.shift(horizon + STEPS_PER_WEEK), df["station_id"], STEPS_PER_DAY
+    )
+
+    df["lvl4_d"] = (df["roll4"] + EPS) / (df["roll4_d"] + EPS)
+    df["lvl4_w"] = (df["roll4"] + EPS) / (df["roll4_w"] + EPS)
+    df["lvl16_d"] = (df["roll16"] + EPS) / (df["roll16_d"] + EPS)
+    df["lvl16_w"] = (df["roll16"] + EPS) / (df["roll16_w"] + EPS)
+    df["lvl96_w"] = (df["roll96"] + EPS) / (df["roll96_w"] + EPS)
+
+    # Expectativa adaptativa: lo de ayer / la semana pasada a esa hora,
+    # escalado por cuánto se desvía hoy el nivel reciente.
+    df["exp_w"] = df["tweek"] * df["lvl16_w"]
+    df["exp_d"] = df["tday"] * df["lvl16_d"]
 
 
 def build_training_design(observations: pd.DataFrame) -> pd.DataFrame:
@@ -76,6 +127,14 @@ def build_training_design(observations: pd.DataFrame) -> pd.DataFrame:
     partes = [build_design(observations, h) for h in HORIZONS]
     stacked = pd.concat(partes, ignore_index=True)
     return stacked.dropna(subset=FEATURE_COLUMNS + ["demand"])
+
+
+def build_global_training_design(observations: pd.DataFrame) -> pd.DataFrame:
+    """Como build_training_design, pero exige también las features de nivel
+    (necesitan 2 semanas de historia por los rezagos semanales)."""
+    partes = [build_design(observations, h) for h in HORIZONS]
+    stacked = pd.concat(partes, ignore_index=True)
+    return stacked.dropna(subset=FEATURE_COLUMNS + LEVEL_COLUMNS + ["demand"]).reset_index(drop=True)
 
 
 def build_serving_design(observations: pd.DataFrame, targets: pd.DataFrame) -> pd.DataFrame:

@@ -18,9 +18,9 @@ from datetime import timedelta
 import pandas as pd
 from dotenv import load_dotenv
 
-from src import db
+from src import db, model
 from src.data import fetch_all_observations
-from src.features import FEATURE_COLUMNS, HORIZONS, build_serving_design
+from src.features import HORIZONS, build_serving_design
 from src.predict import (
     NoOpenCycle,
     double_check_predictions,
@@ -62,14 +62,14 @@ def run_simulated_cycle() -> None:
     cutoff = _next_cutoff(observations)
     targets = _build_targets(observations, cutoff)
 
+    bundle, champion = load_champion()
     conocido = observations[observations["observed_at"] <= cutoff]
-    design = build_serving_design(conocido, targets).reset_index(drop=True)
-    design = design.dropna(subset=FEATURE_COLUMNS)
+    design = build_serving_design(conocido, targets)
+    design = design.dropna(subset=model.required_features(bundle)).reset_index(drop=True)
     if design.empty:
         print("Simulación sin historial suficiente todavía.")
         return
 
-    bundle, champion = load_champion()
     design["value"] = double_check_predictions(bundle, design)
 
     cycle_id = f"sim-{cutoff.isoformat()}"

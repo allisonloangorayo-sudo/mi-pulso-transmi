@@ -27,7 +27,7 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Calcular accuracy/drift y disparar reentrenamiento si cae >=5 pts
+      - name: Revisar el champion y disparar reentrenamiento si cae >=3 pts, se rompe una estación o está viejo
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}

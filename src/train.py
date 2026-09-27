@@ -1,4 +1,4 @@
-"""Entrenamiento: un modelo por estación, horizonte como feature.
+"""Entrenamiento: modelo global normalizado por nivel (ver src.model).
 
 Uso:
     python -m src.train
@@ -11,15 +11,20 @@ mismo conjunto de validación en todas las variantes):
     + estación como feature                               85.83%
     + un modelo por estación                              86.64%
     + ensamble RF/boosting (48 modelos, ~2 GB)            86.74%
-    ESTA: 12 modelos por estación, boosting MAE, 11.8 MB  86.69%
+    12 modelos por estación, boosting MAE, 11.8 MB        86.69%
 
-Se eligió la última: empata en accuracy con el ensamble y pesa 99% menos,
-lo que importa porque `infer` descarga el artefacto en cada corrida.
+Esas cifras son sobre histórico estable. En la ventana competitiva (ciclos
+reales, 11 a 15-sep) aparecieron cambios de nivel (05100 cayó al ~40%) y el
+modelo por estación se quedó en 82.48%. Ver experiments/06_nivel_adaptativo.py:
+
+    por estación, crudo                                   82.48%
+    ESTA: global normalizado por nivel, ensamble 3 escalas  (ver experimento)
+
 La pérdida MAE se usa porque la métrica oficial (WAPE) es error absoluto.
 
 Promoción: validación cruzada de 2 pliegues temporales; el candidato debe
-superar a los baselines en AMBOS, y reemplaza al champion solo si su peor
-pliegue supera la métrica del champion vigente.
+superar a los baselines en AMBOS, y luego gana el duelo contra el champion
+sobre la misma ventana (ver duel_against_champion).
 """
 
 from __future__ import annotations
@@ -33,16 +38,10 @@ import joblib
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
-from sklearn.ensemble import HistGradientBoostingRegressor
 
+from src import model
 from src.data import fetch_all_observations
-from src.features import (
-    FEATURE_COLUMNS,
-    HORIZONS,
-    STEPS_PER_DAY,
-    STEPS_PER_WEEK,
-    build_training_design,
-)
+from src.features import GLOBAL_FEATURES, HORIZONS, build_global_training_design
 
 load_dotenv()
 
@@ -85,30 +84,12 @@ def git_commit_sha() -> str | None:
         return None
 
 
-def make_model() -> HistGradientBoostingRegressor:
-    # loss="absolute_error" alinea el entrenamiento con WAPE, la métrica oficial.
-    return HistGradientBoostingRegressor(
-        loss="absolute_error", max_iter=600, learning_rate=0.05, random_state=42
-    )
+def train_bundle(train_design: pd.DataFrame) -> dict:
+    return model.train_global(train_design)
 
 
-def train_bundle(train_design: pd.DataFrame) -> dict[str, HistGradientBoostingRegressor]:
-    modelos = {}
-    for station_id, grupo in train_design.groupby("station_id", observed=True):
-        modelo = make_model()
-        modelo.fit(grupo[FEATURE_COLUMNS], grupo["demand"])
-        modelos[str(station_id)] = modelo
-    return modelos
-
-
-def predict_bundle(modelos: dict, design: pd.DataFrame) -> np.ndarray:
-    salida = np.zeros(len(design))
-    for station_id, grupo in design.groupby("station_id", observed=True):
-        modelo = modelos.get(str(station_id))
-        if modelo is None:
-            continue
-        salida[design.index.get_indexer(grupo.index)] = modelo.predict(grupo[FEATURE_COLUMNS])
-    return np.clip(salida, 0, None)
+def predict_bundle(bundle: dict, design: pd.DataFrame) -> np.ndarray:
+    return model.predict(bundle, design)
 
 
 def evaluate_baselines(validation: pd.DataFrame) -> dict[str, float]:
@@ -144,10 +125,14 @@ def cross_validate(design: pd.DataFrame) -> list[dict]:
 
 
 MIN_FILAS_DUELO = 2000
+# Tolerancia del duelo: dos corridas de la misma receta empatan (misma
+# semilla, mismos datos), y en ese caso debe ganar el modelo con datos más
+# frescos. Exigir "estrictamente mayor" congelaba al champion para siempre.
+TOLERANCIA_DUELO = 0.10
 
 
 def duel_against_champion(design: pd.DataFrame, champion: dict) -> tuple[float, float] | None:
-    """Compara candidato y champion sobre la MISMA ventana.
+    """Compara la receta del candidato con el champion sobre la MISMA ventana.
 
     Por qué existe: la métrica guardada de cada modelo se calculó sobre una
     ventana temporal distinta, y unas ventanas son más difíciles que otras
@@ -159,6 +144,11 @@ def duel_against_champion(design: pd.DataFrame, champion: dict) -> tuple[float, 
     La ventana del duelo es todo lo posterior al corte de datos del champion,
     así que ninguno de los dos la vio al entrenar. Devuelve None si todavía
     no hay suficientes datos nuevos para juzgar.
+
+    Ojo: lo que se juzga es la *receta* (el retador se entrena con los mismos
+    datos que tuvo el champion). Si la receta no pierde, se promueve el
+    candidato entrenado con TODO el histórico, que además tiene los datos
+    nuevos.
     """
     corte_champion = pd.Timestamp(champion["data_cutoff"])
     holdout = design[design["observed_at"] > corte_champion]
@@ -172,11 +162,11 @@ def duel_against_champion(design: pd.DataFrame, champion: dict) -> tuple[float, 
     holdout = holdout.reset_index(drop=True)
     score_retador = official_accuracy(holdout.assign(prediction=predict_bundle(retador, holdout)))
 
-    from src.predict import load_champion, predict_bundle as predict_champion
+    from src.predict import load_champion
 
     bundle_champion, _ = load_champion()
     score_champion = official_accuracy(
-        holdout.assign(prediction=predict_champion(bundle_champion, holdout))
+        holdout.assign(prediction=model.predict(bundle_champion, holdout))
     )
 
     print(f"\nDuelo sobre {len(holdout):,} filas posteriores a {corte_champion}:")
@@ -201,7 +191,7 @@ def run() -> None:
     observations = fetch_all_observations()
     print(f"Observaciones: {len(observations):,} hasta {observations['observed_at'].max()}")
 
-    design = build_training_design(observations)
+    design = build_global_training_design(observations)
     print(f"Filas de entrenamiento (4 horizontes apilados): {len(design):,}")
 
     print("\n=== Validación cruzada (2 pliegues temporales) ===")
@@ -223,17 +213,12 @@ def run() -> None:
     print("\n=== Modelo final con todo el histórico ===")
     modelos = train_bundle(design)
     double_check(modelos, design)
-    print(f"Doble verificación: OK. {len(modelos)} modelos (uno por estación).")
+    print(f"Doble verificación: OK. Ensamble global de {len(modelos['models'])} escalas.")
 
     ARTIFACTS_DIR.mkdir(exist_ok=True)
     version = datetime.now(timezone.utc).strftime("v%Y%m%dT%H%M%SZ")
     artifact_path = ARTIFACTS_DIR / f"{version}.joblib"
-    bundle = {
-        "version": version,
-        "models": modelos,
-        "features": FEATURE_COLUMNS,
-        "horizons": list(HORIZONS),
-    }
+    bundle = {**modelos, "version": version, "horizons": list(HORIZONS)}
     joblib.dump(bundle, artifact_path, compress=3)
     tamano_mb = artifact_path.stat().st_size / 1e6
 
@@ -242,7 +227,7 @@ def run() -> None:
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "data_cutoff": str(observations["observed_at"].max()),
         "commit_sha": git_commit_sha(),
-        "features": FEATURE_COLUMNS,
+        "features": GLOBAL_FEATURES,
         "cross_validation": folds,
         "validation_metric": peor,
         "artifact_mb": round(tamano_mb, 2),
@@ -261,7 +246,7 @@ def run() -> None:
             data_cutoff=observations["observed_at"].max(),
             artifact_path=remote,
             commit_sha=metadata["commit_sha"],
-            features=FEATURE_COLUMNS,
+            features=GLOBAL_FEATURES,
             validation_metric=peor,
             status="candidate",
         )
@@ -275,13 +260,18 @@ def run() -> None:
 
         duelo = duel_against_champion(design, champion)
         if duelo is None:
-            # Sin datos nuevos suficientes, no se toca al champion: la novedad
-            # por sí sola no es una mejora.
-            print("No promovido: falta evidencia nueva para comparar.")
+            # Sin datos nuevos suficientes para juzgar una receta distinta, no
+            # se toca al champion: la novedad por sí sola no es una mejora. Si
+            # la receta es la misma, el candidato solo agrega datos frescos.
+            if list(champion.get("features") or []) == GLOBAL_FEATURES:
+                db.promote(version)
+                print(f"PROMOVIDO a champion: {version} (misma receta, datos más frescos).")
+            else:
+                print("No promovido: falta evidencia nueva para comparar recetas.")
             return
 
         score_retador, score_champion = duelo
-        if score_retador > score_champion:
+        if score_retador >= score_champion - TOLERANCIA_DUELO:
             db.promote(version)
             print(f"PROMOVIDO a champion: {version} "
                   f"({score_retador:.2f} vs {score_champion:.2f} del anterior).")

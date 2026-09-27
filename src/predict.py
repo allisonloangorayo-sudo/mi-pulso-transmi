@@ -7,9 +7,10 @@ Flujo (no reintenta a ciegas; reutiliza idempotency-key; 404 = salida en verde):
     get_current_cycle -> receipt_exists? -> load_champion ->
     predict -> doble verificación -> validate -> submit -> save_receipt
 
-El modelo es un bundle: un regresor por estación, con el horizonte como
-feature. Las features se construyen con la misma función que se usó al
-entrenar (src.features), de modo que no puede reaparecer el train/serve skew.
+El modelo es un bundle (ver src.model: global normalizado o, en la
+generación anterior, uno por estación). Las features se construyen con la
+misma función que se usó al entrenar (src.features), de modo que no puede
+reaparecer el train/serve skew.
 """
 
 from __future__ import annotations
@@ -24,8 +25,9 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
+from src import model
 from src.data import fetch_all_observations
-from src.features import FEATURE_COLUMNS, build_serving_design
+from src.features import build_serving_design
 from src.http_utils import request_with_retry
 
 load_dotenv()
@@ -92,14 +94,7 @@ def targets_to_frame(targets: list[dict]) -> pd.DataFrame:
 
 
 def predict_bundle(bundle: dict, design: pd.DataFrame) -> np.ndarray:
-    modelos = bundle["models"]
-    salida = np.zeros(len(design))
-    for station_id, grupo in design.groupby("station_id", observed=True):
-        modelo = modelos.get(str(station_id))
-        if modelo is None:
-            raise RuntimeError(f"El bundle no tiene modelo para la estación {station_id}.")
-        salida[design.index.get_indexer(grupo.index)] = modelo.predict(grupo[FEATURE_COLUMNS])
-    return np.clip(salida, 0, None)
+    return model.predict(bundle, design)
 
 
 def double_check_predictions(bundle: dict, design: pd.DataFrame) -> np.ndarray:
@@ -120,12 +115,13 @@ def build_batch(cycle: dict, bundle: dict) -> pd.DataFrame:
     observations = observations[observations["observed_at"] <= pd.Timestamp(cycle["data_cutoff"])]
 
     design = build_serving_design(observations, targets).reset_index(drop=True)
-    faltantes = design[FEATURE_COLUMNS].isna().any(axis=1)
+    columnas = model.required_features(bundle)
+    faltantes = design[columnas].isna().any(axis=1)
     if faltantes.any():
-        # Sin historial suficiente para esa estación: se rellena con el último
-        # valor conocido en vez de enviar un hueco (un target ausente puntúa 0).
-        design.loc[faltantes, FEATURE_COLUMNS] = design.loc[faltantes, FEATURE_COLUMNS].fillna(
-            design[FEATURE_COLUMNS].median()
+        # Sin historial suficiente para esa estación: se rellena con la mediana
+        # en vez de enviar un hueco (un target ausente puntúa 0).
+        design.loc[faltantes, columnas] = design.loc[faltantes, columnas].fillna(
+            design[columnas].median()
         )
 
     design["value"] = double_check_predictions(bundle, design)

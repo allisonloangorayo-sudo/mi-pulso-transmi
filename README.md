@@ -39,7 +39,8 @@ pipeline. `drift.py` vigila caídas *relativas* a ese nivel, no una meta fija.
 src/
 ├── ingest.py    # collector idempotente: descarga y upsert a Supabase
 ├── features.py  # calendario + rezagos (lags)
-├── train.py     # baselines + candidato + promoción automática a champion
+├── model.py     # entrenamiento/predicción de cada tipo de bundle (global normalizado y por estación)
+├── train.py     # baselines + candidato + duelo + promoción automática a champion
 ├── infer.py     # punto de entrada real: ciclo oficial si existe, si no simulación
 ├── predict.py   # contrato oficial de submissions (ya en producción)
 ├── drift.py     # accuracy acumulada vs. rolling 24h + dispara reentrenamiento
@@ -49,7 +50,7 @@ supabase/schema.sql   # DDL de la memoria operacional (9 tablas)
 .github/workflows/
 ├── collector.yml  # cada 10 min: sincroniza histórico + stream a Supabase
 ├── infer.yml      # cada 10 min: 48 predicciones (12 estaciones x 4 horizontes) + submission real
-├── drift.yml      # cada hora: accuracy/drift; dispara train.yml si cae ≥5 pts
+├── drift.yml      # cada hora: revisión del champion; dispara train.yml si cae ≥3 pts, se rompe una estación o está viejo
 └── train.yml      # manual + disparado automáticamente por drift.yml
 ```
 
@@ -59,7 +60,7 @@ supabase/schema.sql   # DDL de la memoria operacional (9 tablas)
 |---|---|---|
 | `collector.yml` | cada 10 min | Sincroniza histórico + stream incremental a Supabase (idempotente). |
 | `infer.yml` | cada 10 min | Si hay ciclo real abierto: genera 48 predicciones y las envía a `/v1/submissions`. Si no: simula sobre el histórico para seguir midiendo accuracy/drift. |
-| `drift.yml` | cada hora | Calcula accuracy acumulada vs. rolling 24h y la guarda en `drift_metrics`. Si la caída llega a **5 puntos**, dispara `train.yml` automáticamente (`gh workflow run`). |
+| `drift.yml` | cada hora | Revisa al champion sobre evaluaciones reales (acumulada, rolling 24h, referencia y accuracy por estación) y lo guarda en `drift_metrics`. Dispara `train.yml` si la caída llega a **3 puntos** (alerta; ≥5 crítica), si una estación cae ≥10 puntos o si el champion lleva más de 24 h sin datos nuevos. |
 | `train.yml` | manual + automático (por drift) | Entrena un candidato, lo compara contra el champion vigente y **lo promueve automáticamente si lo supera** (nunca si no). |
 
 `collector.yml` e `infer.yml` corren cada 10 minutos porque los ciclos reales
@@ -114,7 +115,43 @@ compara contra dos baselines (repetir 24h antes / 7 días antes), corre una
 doble verificación de determinismo y solo promueve si el **peor** pliegue
 supera al champion vigente.
 
-## Cómo se llegó al modelo actual (evidencia)
+## Modelo actual: global normalizado por nivel (2026-09-27)
+
+En la ventana competitiva el modelo por estación cayó a **76.5% real** (7.º
+lugar, 80.44% acumulado). La causa: desde el 13-sep la estación 05100 opera
+al ~40% de su demanda habitual (y 06000/07111 absorben el resto), pero el
+modelo seguía a `sday`/`sweek` y a niveles absolutos: predecía el doble y
+05100 quedó en **7.4%** de accuracy. El drift marcaba 4.5 pts de caída, por
+debajo del umbral de 5, y nunca reentrenó.
+
+Cambios (evidencia en [`experiments/06_nivel_adaptativo.py`](experiments/06_nivel_adaptativo.py),
+backtest que replica los ciclos reales del 11 al 15-sep):
+
+| Configuración | Accuracy (ciclos reales, reentreno diario) |
+|---|---|
+| Por estación, demanda cruda (anterior) | 82.48% |
+| Global + ratios de nivel | 83.14% |
+| Global normalizado por `roll96` | 83.61% |
+| **Ensamble global normalizado (`roll96`, `roll16`, `exp_w`)** | **83.81%** |
+
+- Features de nivel: ratios de lo reciente contra la misma ventana ayer y
+  hace una semana (`lvl*`) y una expectativa adaptativa (`exp_w` = demanda
+  de la semana pasada × nivel actual).
+- Un solo modelo para las 12 estaciones (estación como categórica), con la
+  demanda dividida por una escala de nivel reciente y `sample_weight` = escala
+  para que la pérdida siga siendo WAPE.
+- Duelo contra el champion sobre la misma ventana: **81.22 vs 76.49**.
+
+Dos bugs de la automatización corregidos en el mismo cambio:
+
+- **El duelo nunca dejaba pasar un reentreno de la misma receta**: el retador
+  se entrena con los datos que tuvo el champion, así que empataba y se exigía
+  "estrictamente mayor". Ahora se juzga la receta con tolerancia de 0.1 pts
+  y, si no pierde, se promueve el candidato con todos los datos.
+- **La referencia del drift era el arranque del propio champion**: uno que
+  nace malo se usaba a sí mismo de vara. Ahora también se compara con cómo
+  rendía el modelo anterior.
+
 
 Todas las cifras son la métrica oficial (WAPE→accuracy por estación,
 promediada), evaluadas sobre **el mismo conjunto** y los **4 horizontes**.
