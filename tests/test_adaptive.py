@@ -42,7 +42,8 @@ def test_features_do_not_look_past_the_cutoff(horizon):
     corte = objetivo - pd.Timedelta(minutes=15 * horizon)
     alterado.loc[alterado["observed_at"] > corte, "demand"] *= 7
     cambiado = adaptive.build_design(alterado, (horizon,))
-    fila = lambda d: d[d["observed_at"] == objetivo][adaptive.FEATURES].iloc[0]  # noqa: E731
+    columnas = adaptive.FEATURES + adaptive.SIMPLE_EXPERTS
+    fila = lambda d: d[d["observed_at"] == objetivo][columnas].iloc[0]  # noqa: E731
     pd.testing.assert_series_equal(fila(original), fila(cambiado))
 
 

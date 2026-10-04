@@ -33,8 +33,11 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 HORIZONS = (1, 2, 3, 4)
 CANDIDATE_PERIODS = np.arange(8, 101)
 WINDOWS = (16, 48)
-EXPERT_WINDOW = 6          # targets recientes con los que se pondera a cada experto
-EXPERT_TEMPERATURE = 20.0  # qué tan fuerte se castiga el error relativo
+# Ponderación de expertos: con la evidencia de las 12 estaciones juntas (los
+# cambios de régimen ocurren en todas a la vez), basta con pocos instantes.
+EXPERT_WINDOW = 3          # instantes recientes con los que se pondera a cada experto
+EXPERT_TEMPERATURE = 40.0  # qué tan fuerte se castiga el error relativo
+LEVEL_WINDOW = 48          # nivel de cada estación para volver relativo su error
 RECENCY_DAYS = 7.0         # vida media (e-fold) del peso de cada fila al entrenar
 RECENT_DAYS = 3.0          # el experto "gbm_reciente" solo ve estos últimos días
 SCALE = "r16"
@@ -48,7 +51,7 @@ OTHER_FEATURES = (
     [f"P{w}" for w in WINDOWS] + [f"R{w}" for w in WINDOWS] + [f"lv{w}" for w in WINDOWS] + ["horizon"]
 )
 FEATURES = LEVEL_FEATURES + OTHER_FEATURES
-SIMPLE_EXPERTS = ["sp16", "exp16", "lin16", "exp48", "lin48", "a0"]
+SIMPLE_EXPERTS = ["sp16", "exp16", "lin16", "exp48", "lin48", "a0", "quad12d", "lin8d"]
 REQUIRED = ["a5", "r96", "sp16", "sp48", "sp2_48"]
 
 
@@ -76,6 +79,20 @@ def period_track(y: np.ndarray, window: int) -> tuple[np.ndarray, np.ndarray]:
             periodo[t] = CANDIDATE_PERIODS[j]
             relativo[t] = media[j] / nivel[t]
     return periodo, relativo
+
+
+def _local_fit(y: np.ndarray, tt: np.ndarray, ok: np.ndarray, largo: int, grado: int, h: int) -> np.ndarray:
+    """Polinomio de `grado` sobre las últimas `largo` observaciones hasta el
+    corte, evaluado `h` pasos adelante (como una sola convolución)."""
+    x = np.arange(-largo + 1, 1)
+    pesos = np.vander(np.array([h]), grado + 1)[0] @ np.linalg.pinv(np.vander(x, grado + 1))
+    out = np.full(len(y), np.nan)
+    if len(y) < largo:
+        return out
+    ajuste = np.convolve(y, pesos[::-1], mode="valid")  # ajuste[k]: desde el corte k+largo-1
+    m = ok & (tt >= largo - 1)
+    out[m] = ajuste[tt[m] - largo + 1]
+    return np.clip(out, 0, None)
 
 
 def _station_features(y: np.ndarray, horizon: int, tracks: dict) -> dict[str, np.ndarray]:
@@ -119,6 +136,11 @@ def _station_features(y: np.ndarray, horizon: int, tracks: dict) -> dict[str, np
 
     f["s96"] = at(T - 96)
     f["slope"] = f["a0"] - f["a2"]
+    # Extrapolación local amortiguada (mitad ajuste, mitad último dato). Sola
+    # es mala, pero tras un cambio de régimen gana al GBM por 10-25 pts
+    # durante varias horas, hasta que el periodo nuevo se puede detectar.
+    f["quad12d"] = 0.5 * _local_fit(y, tt, ok, 12, 2, horizon) + 0.5 * f["a0"]
+    f["lin8d"] = 0.5 * _local_fit(y, tt, ok, 8, 1, horizon) + 0.5 * f["a0"]
     f["horizon"] = np.full(n, float(horizon))
     return f
 
@@ -223,6 +245,7 @@ def train(design: pd.DataFrame) -> dict:
         "experts": ["gbm", "gbm_reciente", "nivel"] + SIMPLE_EXPERTS,
         "expert_window": EXPERT_WINDOW,
         "temperature": EXPERT_TEMPERATURE,
+        "pooled": True,
     }
 
 
@@ -231,12 +254,13 @@ def expert_forecasts(bundle: dict, design: pd.DataFrame) -> pd.DataFrame:
     validas = design[REQUIRED].notna().all(axis=1).to_numpy()
     gbm = np.full(len(design), np.nan)
     reciente = np.full(len(design), np.nan)
-    if validas.any():
+    if bundle.get("gbm") is not None and validas.any():
         X, escala = _matrix(design[validas])
         gbm[validas] = bundle["gbm"].predict(X) * escala
         if bundle.get("gbm_recent") is not None:
             reciente[validas] = bundle["gbm_recent"].predict(X) * escala
-    salida["gbm"] = gbm
+    if bundle.get("gbm") is not None:
+        salida["gbm"] = gbm
     if bundle.get("gbm_recent") is not None:
         salida["gbm_reciente"] = reciente
     if bundle.get("level_model") is not None:
@@ -249,8 +273,9 @@ def expert_forecasts(bundle: dict, design: pd.DataFrame) -> pd.DataFrame:
         if listas.any():
             valores[listas] = model.predict(bundle["level_model"], nivel[listas].reset_index(drop=True))
         salida["nivel"] = valores
-    for experto in SIMPLE_EXPERTS:
-        salida[experto] = design[experto].to_numpy(dtype=float)
+    for experto in bundle.get("experts", []):
+        if experto in SIMPLE_EXPERTS:
+            salida[experto] = design[experto].to_numpy(dtype=float)
     # Un experto sin valor (historia corta) cae al último dato conocido.
     respaldo = design["a0"].to_numpy(dtype=float)
     for experto in salida.columns:
@@ -258,41 +283,80 @@ def expert_forecasts(bundle: dict, design: pd.DataFrame) -> pd.DataFrame:
     return np.clip(salida, 0, None)
 
 
+def _weights(relativo: np.ndarray, temperatura: float) -> np.ndarray:
+    sin_dato = ~np.isfinite(relativo).any(axis=1)
+    relativo = np.where(np.isfinite(relativo), relativo, np.inf)
+    relativo[sin_dato] = 0.0  # sin evidencia: pesos iguales
+    relativo = relativo - relativo.min(axis=1, keepdims=True)
+    pesos = np.exp(-temperatura * relativo)
+    return pesos / pesos.sum(axis=1, keepdims=True)
+
+
 def predict(bundle: dict, design: pd.DataFrame) -> np.ndarray:
     """Combina los expertos con pesos según su error reciente.
 
-    `design` debe traer, por estación y horizonte, la historia contigua antes
-    de las filas a predecir (build_design ya lo hace): el error de un experto
-    para el target T solo se conoce cuando T <= corte, por eso la media móvil
-    se desplaza `horizon` filas.
+    `design` debe traer la historia contigua antes de las filas a predecir
+    (build_design ya lo hace): el error de un experto para el target T solo
+    se conoce cuando T <= corte, por eso la media móvil se desplaza `horizon`.
+
+    Con `pooled` (modelos desde 2026-10-04) el error relativo se promedia
+    sobre las 12 estaciones en cada instante: los cambios de régimen llegan a
+    todas a la vez y así se detectan con 12 veces más evidencia.
+    Walk-forward desde 18-sep: 83.58 -> 85.05; horas tras el cambio del
+    20-sep: 68.3 -> 72.9.
     """
     design = design.reset_index(drop=True)
     expertos = expert_forecasts(bundle, design)
     nombres = list(expertos.columns)
     k = int(bundle.get("expert_window", EXPERT_WINDOW))
     temperatura = float(bundle.get("temperature", EXPERT_TEMPERATURE))
+    F_todo = expertos[nombres].to_numpy(dtype=float)
+    real = design["demand"].to_numpy(dtype=float)
+    if "imputed" in design:
+        real = np.where(design["imputed"].astype(bool).to_numpy(), np.nan, real)
     resultado = np.full(len(design), np.nan)
 
+    if bundle.get("pooled"):
+        nivel = (
+            pd.Series(real).groupby(design["station_id"].to_numpy())
+            .transform(lambda s: s.rolling(LEVEL_WINDOW, min_periods=1).mean())
+            .to_numpy() + 1.0
+        )
+        relativo = np.abs(F_todo - real[:, None]) / nivel[:, None]
+        for horizon, grupo in design.groupby("horizon", sort=False):
+            h = int(horizon)
+            filas = grupo.index.to_numpy()
+            instantes = design.loc[filas, "observed_at"].to_numpy()
+            por_instante = pd.DataFrame(relativo[filas], index=instantes).groupby(level=0).mean()
+            media = por_instante.sort_index().rolling(k, min_periods=1).mean().shift(h)
+            pesos = _weights(media.reindex(instantes).to_numpy(), temperatura)
+            resultado[filas] = (pesos * F_todo[filas]).sum(axis=1)
+        return np.clip(resultado, 0, None)
+
+    # Modelos anteriores: cada estación pondera con su propio error.
     for (_, horizon), grupo in design.groupby(["station_id", "horizon"], observed=True, sort=False):
         orden = grupo.sort_values("observed_at").index.to_numpy()
         h = int(horizon)
-        F = expertos.loc[orden, nombres].to_numpy(dtype=float)
-        real = design.loc[orden, "demand"].to_numpy(dtype=float)
-        if "imputed" in design:
-            real = np.where(design.loc[orden, "imputed"].astype(bool).to_numpy(), np.nan, real)
-        errores = pd.DataFrame(np.abs(F - real[:, None]))
+        F = F_todo[orden]
+        errores = pd.DataFrame(np.abs(F - real[orden][:, None]))
         media = errores.rolling(k, min_periods=1).mean().shift(h).to_numpy()
-        nivel = pd.Series(real).rolling(k, min_periods=1).mean().shift(h).to_numpy() + 1.0
-        relativo = media / nivel[:, None]
-        sin_dato = ~np.isfinite(relativo).any(axis=1)
-        relativo = np.where(np.isfinite(relativo), relativo, np.inf)
-        relativo[sin_dato] = 0.0  # sin evidencia: pesos iguales
-        relativo = relativo - relativo.min(axis=1, keepdims=True)
-        pesos = np.exp(-temperatura * relativo)
-        pesos = pesos / pesos.sum(axis=1, keepdims=True)
-        resultado[orden] = (pesos * F).sum(axis=1)
-
+        nivel = pd.Series(real[orden]).rolling(k, min_periods=1).mean().shift(h).to_numpy() + 1.0
+        resultado[orden] = (_weights(media / nivel[:, None], temperatura) * F).sum(axis=1)
     return np.clip(resultado, 0, None)
+
+
+def simple_bundle() -> dict:
+    """Ensamble solo de expertos simples: sin modelos entrenados ni archivos.
+    Es el respaldo de inferencia cuando el champion no se puede usar."""
+    return {
+        "kind": "adaptive_ensemble",
+        "gbm": None,
+        "experts": list(SIMPLE_EXPERTS),
+        "expert_window": EXPERT_WINDOW,
+        "temperature": EXPERT_TEMPERATURE,
+        "pooled": True,
+        "version": "respaldo-expertos-simples",
+    }
 
 
 def forecast_targets(bundle: dict, observations: pd.DataFrame, targets: pd.DataFrame) -> pd.DataFrame:

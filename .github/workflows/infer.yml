@@ -13,6 +13,10 @@ jobs:
   infer:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write   # caché del modelo
+      issues: write    # alerta cuando un ciclo se entrega con respaldo o no se entrega
     steps:
       - uses: actions/checkout@v4
 
@@ -61,3 +65,20 @@ jobs:
         with:
           path: artifacts
           key: modelo-${{ steps.modelo.outputs.version }}
+
+      # Alerta: un issue abierto (o un comentario en el que ya existe) cada vez
+      # que infer falla, incluido cuando el ciclo se entregó con el respaldo.
+      - name: Alertar falla de inferencia
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          titulo="ALERTA: infer.yml falló (ciclo en riesgo)"
+          abierto=$(gh issue list --state open --search "in:title \"$titulo\"" --json number -q '.[0].number')
+          cuerpo="Corrida fallida: $url ($(date -u +%Y-%m-%dT%H:%MZ)). Revisa si el ciclo se entregó con RESPALDO o quedó sin envío."
+          if [ -n "$abierto" ]; then
+            gh issue comment "$abierto" --body "$cuerpo"
+          else
+            gh issue create --title "$titulo" --body "$cuerpo"
+          fi

@@ -214,6 +214,33 @@ previos del régimen nuevo, con el modelo anterior: 47.6% y 58.6%).
   anteriores y por versión de modelo → `MEJORA / ESTABLE / EMPEORA`, guardado
   en `pipeline_state.accuracy_trend` para el dashboard.
 
+### Evidencia de las 12 estaciones juntas + envío de respaldo (2026-10-04, noche)
+
+**Dónde quedaba margen.** Tras el cambio del 20-sep, entre las 13:00 y las
+19:00 el último dato y una extrapolación local suavizada (61-77%) le ganaban
+al GBM (40-71%), pero el ensamble tardaba en pasarse a ellos: cada estación
+decidía sola con 3-6 errores. Los cambios de régimen llegan a las 12 a la
+vez, así que ahora el peso de cada experto sale del error relativo
+**promedio de las 12 estaciones** (por horizonte), con K=3 y T=40, y se
+suman los expertos `quad12d` y `lin8d` (extrapolación amortiguada).
+
+| Walk-forward desde 18-sep (reentreno 3 h) | Total | Cambio 18-sep | Cambio 20-sep | Últimas 6 h |
+|---|---|---|---|---|
+| Cada estación por su cuenta (anterior) | 83.58 | 55.4 | 68.3 | 85.4 |
+| **12 estaciones juntas + expertos locales** | **85.05** | **58.3** | **72.9** | **87.0** |
+
+Con el código de producción, tramo 20-sep 07:30 → 21-sep 05:00: **80.15 →
+82.55** (últimas 6 h 85.29 → 86.86), mejor en los 7 bloques.
+
+**Envío de respaldo.** Un ciclo sin envío vale 0 para siempre (así se
+perdieron 15 ciclos). Si el modelo falla, `predict.run` envía el ensamble de
+expertos simples, sin GBM ni archivos, que en el backtest da **83.84%**
+(contra 85.05% del modelo completo). Reglas para no pisar un envío bueno:
+si Supabase confirma que ya hay envío, no hace nada; si no se puede saber,
+espera a los últimos 12 minutos del ciclo. Cuando usa el respaldo, la
+corrida termina en error a propósito e `infer.yml` abre (o comenta) el issue
+**"ALERTA: infer.yml falló (ciclo en riesgo)"**.
+
 ## Modelo anterior: global normalizado por nivel (2026-09-27)
 
 En la ventana competitiva el modelo por estación cayó a **76.5% real** (7.º

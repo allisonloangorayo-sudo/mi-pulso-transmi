@@ -231,6 +231,47 @@ def save_receipt(
     )
 
 
+FALLBACK_FINAL_WINDOW = pd.Timedelta(minutes=12)  # infer.yml corre cada 10 min
+
+
+class FallbackSubmitted(RuntimeError):
+    """Se envió el respaldo: la corrida termina en error a propósito para que
+    infer.yml abra la alerta, aunque el ciclo sí quedó entregado."""
+
+
+def cycle_has_receipt(cycle_id: str) -> bool | None:
+    """¿Ya enviamos algo para este ciclo, con cualquier modelo? None = no se sabe."""
+    try:
+        from src import db
+
+        filas = (
+            db.get_client().table("predictions").select("id")
+            .eq("cycle_id", cycle_id).not_.is_("submission_id", "null").limit(1).execute().data
+        )
+        return bool(filas)
+    except Exception as exc:  # noqa: BLE001
+        print(f"No se pudo consultar recibos en Supabase ({type(exc).__name__}: {exc}).")
+        return None
+
+
+def fallback_batch(cycle: dict) -> pd.DataFrame:
+    """Predicción de respaldo: ensamble de expertos simples y, si eso falla,
+    el último dato conocido de cada estación. Solo necesita la API de datos."""
+    from src import adaptive
+
+    targets = targets_to_frame(cycle["targets"])
+    observations = fetch_all_observations()
+    observations = observations[observations["observed_at"] <= pd.Timestamp(cycle["data_cutoff"])]
+    try:
+        batch = forecast_with_check(adaptive.simple_bundle(), observations, targets)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Respaldo de expertos simples falló ({type(exc).__name__}: {exc}); uso el último dato.")
+        ultimo = observations.sort_values("observed_at").groupby("station_id")["demand"].last()
+        batch = targets.assign(value=targets["station_id"].map(ultimo))
+        batch["value"] = batch["value"].fillna(float(ultimo.median()))
+    return batch[["station_id", "target_at", "horizon", "value"]]
+
+
 def run() -> None:
     try:
         cycle = get_current_cycle()
@@ -238,25 +279,50 @@ def run() -> None:
         print("No hay ciclo abierto (404 no_open_cycle). Fin en verde.")
         return {"mode": "sin_ciclo", "status": "ok"}
 
-    bundle, champion = load_champion()
-    if receipt_exists(cycle["cycle_id"], champion["version"]):
-        print(f"Ciclo {cycle['cycle_id']} ya tiene recibo con {champion['version']}. Fin.")
-        return {
-            "mode": "real", "status": "skipped", "cycle_id": cycle["cycle_id"],
-            "data_cutoff": cycle["data_cutoff"], "model_version": champion["version"],
-        }
+    try:
+        bundle, champion = load_champion()
+        if receipt_exists(cycle["cycle_id"], champion["version"]):
+            print(f"Ciclo {cycle['cycle_id']} ya tiene recibo con {champion['version']}. Fin.")
+            return {
+                "mode": "real", "status": "skipped", "cycle_id": cycle["cycle_id"],
+                "data_cutoff": cycle["data_cutoff"], "model_version": champion["version"],
+            }
+        batch = build_batch(cycle, bundle)
+        validate_exact_targets(batch, cycle["targets"])
+        error_modelo = None
+    except Exception as exc:  # noqa: BLE001 - un ciclo sin envío puntúa 0: hay que entregar algo
+        import traceback
 
-    batch = build_batch(cycle, bundle)
-    validate_exact_targets(batch, cycle["targets"])
+        traceback.print_exc()
+        error_modelo = f"{type(exc).__name__}: {exc}"
+        enviado = cycle_has_receipt(cycle["cycle_id"])
+        if enviado:
+            print(f"El modelo falló ({error_modelo}), pero el ciclo ya tiene un envío. No se pisa.")
+            raise
+        cierre = pd.Timestamp(cycle["closes_at"])
+        if enviado is None and pd.Timestamp.now(tz="UTC") < cierre - FALLBACK_FINAL_WINDOW:
+            print("No se sabe si ya hubo envío: el respaldo espera a los últimos minutos del ciclo.")
+            raise
+        print(f"RESPALDO: el modelo falló ({error_modelo}). Envío de expertos simples.")
+        batch = fallback_batch(cycle)
+        validate_exact_targets(batch, cycle["targets"])
+        champion = {"version": "respaldo-expertos-simples", "commit_sha": None}
 
     key = stable_key(cycle["cycle_id"], champion["version"], batch)
     recibo = submit_predictions(cycle["cycle_id"], cycle["data_cutoff"], batch, key, champion)
-    save_receipt(cycle["cycle_id"], champion["version"], batch, recibo["submission_id"], key)
+    try:
+        save_receipt(cycle["cycle_id"], champion["version"], batch, recibo["submission_id"], key)
+    except Exception as exc:  # noqa: BLE001 - el envío ya se hizo; perder el recibo es menor
+        print(f"Aviso: no se pudo guardar el recibo ({type(exc).__name__}: {exc}).")
     print(
         f"Entregado ciclo {cycle['cycle_id']} con {champion['version']}: "
         f"{recibo['predictions_received']}/{recibo['expected_predictions']} predicciones, "
         f"status={recibo['status']}."
     )
+    if error_modelo is not None:
+        raise FallbackSubmitted(
+            f"Ciclo {cycle['cycle_id']} entregado con RESPALDO porque el modelo falló: {error_modelo}"
+        )
     return {
         "mode": "real", "status": "ok", "cycle_id": cycle["cycle_id"],
         "data_cutoff": cycle["data_cutoff"], "model_version": champion["version"],
