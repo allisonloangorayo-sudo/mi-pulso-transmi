@@ -157,7 +157,7 @@ a 44-58% en esos tramos. [`src/adaptive.py`](src/adaptive.py) lo reemplaza:
   recalcula en cada corte según su error en los últimos 8 targets ya
   conocidos de esa estación y horizonte. Cambia de experto en horas, sin
   esperar a un reentrenamiento.
-- `drift.py` reentrena cada 3 h virtuales (antes 6).
+- `drift.py` reentrena cada hora real (ver abajo).
 
 Evidencia en [`experiments/07_regimen_adaptativo.py`](experiments/07_regimen_adaptativo.py)
 (walk-forward con el código de producción, métrica oficial, 4 horizontes):
@@ -178,6 +178,41 @@ Primer entrenamiento en producción (`train.yml`, champion `v20261004T150454Z`):
 pliegues de 2 días con el modelo fijo → **84.92%** y **81.41%** (mejor
 baseline: 61.2% y 64.6%); duelo sobre 3.204 filas que ninguno vio →
 **74.11 vs 59.44** del champion anterior.
+
+### Mejora y operación horaria (2026-10-04, tarde)
+
+**Dónde se pierde accuracy.** En regímenes estables el GBM da 90-93%; casi
+todo el error está en las 6-12 h después de cada cambio de régimen (52.7% y
+58.1% en esos tramos). Las estaciones están parejas (80.6-84.4%) y el sesgo
+es bajo. Lo que se probó:
+
+| Cambio (walk-forward desde 18-sep, reentreno 3 h) | Total | Últimas 6 h |
+|---|---|---|
+| Ensamble anterior | 83.24 | 85.31 |
+| + experto armónico (onda con el periodo detectado) | 83.16 | 85.44 |
+| + extrapolación local lineal/cuadrática | ≤ 83.69 | ≤ 85.26 |
+| **+ GBM solo con los últimos 3 días, ventana K=6** | **83.58** | **85.36** |
+
+Se adoptó el GBM reciente + K=6 (mejor en los 4 días). El armónico y la
+extrapolación local se descartaron: el ruido a 15 min los hace inestables.
+
+**Reentrenar cada hora** es lo que más ayuda tras un cambio (20-sep 07:30 →
+21-sep 05:00, código de producción): cada 3 h → 80.15 (últimas 6 h 85.29);
+**cada 1 h → 80.85 (85.89)**. Hora a hora tras el cambio:
+45 → 52 → 65 → 67 → 72 → 75 → 78 → 82 → 85 → … → 89.6.
+
+Primer ciclo oficial real con el modelo nuevo: **87.89%** (los dos ciclos
+previos del régimen nuevo, con el modelo anterior: 47.6% y 58.6%).
+
+**Operación (`src/drift.py`, cada hora):**
+
+- **Actualización horaria:** si el último entrenamiento tiene ≥ 1 h real,
+  dispara `train.yml` con los datos nuevos (respaldo: `schedule` en el YAML).
+- **Reentrena si cae 2 puntos** (antes 3) contra la referencia, el acumulado
+  o los 6 ciclos anteriores; o si los últimos 6 ciclos bajan de 80%.
+- **Verificación de mejora:** accuracy real de los últimos 6 ciclos vs los 6
+  anteriores y por versión de modelo → `MEJORA / ESTABLE / EMPEORA`, guardado
+  en `pipeline_state.accuracy_trend` para el dashboard.
 
 ## Modelo anterior: global normalizado por nivel (2026-09-27)
 

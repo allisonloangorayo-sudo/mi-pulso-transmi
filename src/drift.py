@@ -4,10 +4,9 @@ Cada corrida (cada hora) hace una revisión completa del champion: accuracy
 acumulada, rolling 24h, referencia y accuracy por estación. Dispara el
 reentrenamiento (train.yml) si ocurre cualquiera de estas cosas:
 
-1. Caída del promedio >= DROP_THRESHOLD_PCT (3 pts) contra la referencia o
-   contra el acumulado. Entre 3 y 5 pts se registra como ALERTA; desde 5 como
-   CRÍTICA. Ambas reentrenan: 3 pts sobre el promedio móvil de 24 h ya son
-   ~4 desviaciones estándar (3.85/√24 ≈ 0.79), no ruido.
+1. Caída del promedio >= DROP_THRESHOLD_PCT (2 pts) contra la referencia, el
+   acumulado o los 6 ciclos anteriores (ver 6). Entre 2 y 5 pts se registra
+   como ALERTA; desde 5 como CRÍTICA. Ambas reentrenan.
 2. Una estación cae >= STATION_DROP_PCT contra su propia referencia. El
    promedio diluye a una sola estación rota: 05100 llegó a 7.4% de accuracy
    y el promedio solo marcaba 4.5 pts de caída, por debajo del umbral
@@ -23,7 +22,15 @@ reentrenamiento (train.yml) si ocurre cualquiera de estas cosas:
    ~60% a ~90% en cuanto ve unas horas del régimen nuevo
    (experiments/07_regimen_adaptativo.py).
 
-Para no disparar cada hora mientras un reentrenamiento ya está en curso (o
+5. Actualización horaria: si el último entrenamiento (de cualquier estado)
+   tiene más de RETRAIN_EVERY_H horas REALES, se reentrena con los datos
+   nuevos aunque no haya caída. Así el modelo se actualiza cada hora.
+6. Verificación de mejora: accuracy real de los últimos 6 ciclos contra los
+   6 anteriores, y por versión de modelo. Se imprime MEJORA / ESTABLE /
+   EMPEORA y se guarda en pipeline_state["accuracy_trend"] para el dashboard;
+   si empeora >= DROP_THRESHOLD_PCT, reentrena.
+
+Para no disparar dos veces mientras un reentrenamiento ya está en curso (o
 cuando el candidato no logró superar al champion), hay un enfriamiento de
 COOLDOWN_H horas entre disparos.
 """
@@ -41,13 +48,14 @@ from src import db
 
 load_dotenv()
 
-DROP_THRESHOLD_PCT = float(os.getenv("DRIFT_DROP_THRESHOLD_PCT", "3.0"))
+DROP_THRESHOLD_PCT = float(os.getenv("DRIFT_DROP_THRESHOLD_PCT", "2.0"))
 CRITICAL_DROP_PCT = float(os.getenv("DRIFT_CRITICAL_DROP_PCT", "5.0"))
 ACCURACY_FLOOR_PCT = float(os.getenv("DRIFT_ACCURACY_FLOOR_PCT", "80.0"))
 FLOOR_WINDOW_CYCLES = 6  # igual que la tabla "últimos 6 ciclos" del portal
 STATION_DROP_PCT = float(os.getenv("DRIFT_STATION_DROP_PCT", "10.0"))
 MAX_STALENESS_H = float(os.getenv("DRIFT_MAX_STALENESS_H", "3"))
-COOLDOWN_H = float(os.getenv("DRIFT_COOLDOWN_H", "2"))
+COOLDOWN_H = float(os.getenv("DRIFT_COOLDOWN_H", "0.75"))
+RETRAIN_EVERY_H = float(os.getenv("DRIFT_RETRAIN_EVERY_H", "1"))
 MIN_SAMPLE_SIZE = 48  # al menos un ciclo (12 estaciones x 4 horizontes) evaluado
 MIN_STATION_SAMPLE = 24  # 6 ciclos por estación antes de juzgarla sola
 
@@ -149,6 +157,65 @@ def _staleness_hours() -> float | None:
     return (pd.Timestamp(filas[0]["target_at"]) - pd.Timestamp(champion["data_cutoff"])).total_seconds() / 3600
 
 
+def _hours_since_last_training() -> float | None:
+    """Horas reales desde el último modelo entrenado (promovido o no)."""
+    filas = db.get_client().table("model_versions").select("trained_at").order(
+        "trained_at", desc=True
+    ).limit(1).execute().data
+    if not filas or not filas[0].get("trained_at"):
+        return None
+    ultimo = pd.Timestamp(filas[0]["trained_at"])
+    if ultimo.tzinfo is None:
+        ultimo = ultimo.tz_localize("UTC")
+    return (pd.Timestamp.now(tz="UTC") - ultimo).total_seconds() / 3600
+
+
+def accuracy_trend(df: pd.DataFrame) -> dict | None:
+    """¿Está mejorando? Últimos 6 ciclos reales contra los 6 anteriores.
+
+    Usa ciclos oficiales (cycle_id), igual que la tabla "últimos 6 ciclos" del
+    portal. También resume la accuracy real de cada versión de modelo.
+    """
+    if "cycle_id" not in df.columns or df["cycle_id"].isna().all():
+        return None
+    reales = df.dropna(subset=["cycle_id"])
+    ciclos = sorted(reales["cycle_id"].unique())
+    if len(ciclos) < 2:
+        return None
+    ultimos = ciclos[-FLOOR_WINDOW_CYCLES:]
+    previos = ciclos[-2 * FLOOR_WINDOW_CYCLES:-FLOOR_WINDOW_CYCLES]
+    actual = _accuracy(reales[reales["cycle_id"].isin(ultimos)])
+    anterior = _accuracy(reales[reales["cycle_id"].isin(previos)]) if previos else None
+    delta = None if anterior is None else actual - anterior
+    if delta is None:
+        veredicto = "SIN_REFERENCIA"
+    elif delta >= 0.5:
+        veredicto = "MEJORA"
+    elif delta <= -DROP_THRESHOLD_PCT:
+        veredicto = "EMPEORA"
+    else:
+        veredicto = "ESTABLE"
+
+    por_version = []
+    for version, grupo in reales.groupby("model_version"):
+        por_version.append({
+            "model_version": version,
+            "cycles": int(grupo["cycle_id"].nunique()),
+            "accuracy": round(_accuracy(grupo), 2),
+            "first_evaluated_at": grupo["evaluated_at"].min().isoformat(),
+        })
+    por_version.sort(key=lambda r: r["first_evaluated_at"])
+    return {
+        "last_cycles": ultimos,
+        "accuracy_last_6": round(actual, 2),
+        "accuracy_prev_6": None if anterior is None else round(anterior, 2),
+        "delta": None if delta is None else round(delta, 2),
+        "verdict": veredicto,
+        "above_floor": actual >= ACCURACY_FLOOR_PCT,
+        "by_model_version": por_version[-10:],
+    }
+
+
 def compute_and_store() -> dict:
     df, origen = _load_evaluations()
     if len(df) < MIN_SAMPLE_SIZE:
@@ -188,6 +255,12 @@ def compute_and_store() -> dict:
     # Señal 5: champion viejo.
     antiguedad = _staleness_hours()
 
+    # Señal 6: actualización horaria con datos nuevos.
+    desde_entrenamiento = _hours_since_last_training()
+
+    # Señal 7: verificación de mejora (últimos 6 ciclos vs los 6 anteriores).
+    tendencia = accuracy_trend(df) if origen == "real" else None
+
     motivos = []
     if caida >= DROP_THRESHOLD_PCT:
         nivel = "CRÍTICA" if caida >= CRITICAL_DROP_PCT else "ALERTA"
@@ -199,6 +272,12 @@ def compute_and_store() -> dict:
                        f"< piso de {ACCURACY_FLOOR_PCT:.0f}")
     if antiguedad is not None and antiguedad > MAX_STALENESS_H:
         motivos.append(f"champion con {antiguedad:.0f} h sin datos nuevos (máx {MAX_STALENESS_H:.0f})")
+    if desde_entrenamiento is None or desde_entrenamiento >= RETRAIN_EVERY_H:
+        horas = "nunca" if desde_entrenamiento is None else f"hace {desde_entrenamiento:.1f} h"
+        motivos.append(f"actualización horaria (último entrenamiento {horas})")
+    if tendencia and tendencia["verdict"] == "EMPEORA":
+        motivos.append(f"los últimos 6 ciclos empeoraron {tendencia['delta']:+.2f} pts "
+                       f"(umbral −{DROP_THRESHOLD_PCT:.0f})")
 
     desde_ultimo = _hours_since_last_trigger()
     en_enfriamiento = desde_ultimo is not None and desde_ultimo < COOLDOWN_H
@@ -215,6 +294,20 @@ def compute_and_store() -> dict:
         print(f"  últimos {FLOOR_WINDOW_CYCLES} ciclos {ultimos_ciclos:.2f} (piso {ACCURACY_FLOOR_PCT:.0f})")
     if antiguedad is not None:
         print(f"  antigüedad del champion: {antiguedad:.1f} h")
+    if desde_entrenamiento is not None:
+        print(f"  último entrenamiento: hace {desde_entrenamiento:.1f} h reales")
+    if tendencia:
+        previo = tendencia["accuracy_prev_6"]
+        print(f"  VERIFICACIÓN: últimos 6 ciclos {tendencia['accuracy_last_6']:.2f}"
+              + (f" vs 6 anteriores {previo:.2f} ({tendencia['delta']:+.2f}) → {tendencia['verdict']}"
+                 if previo is not None else " (sin ciclos anteriores para comparar)")
+              + f" | {'sobre' if tendencia['above_floor'] else 'BAJO'} el piso de {ACCURACY_FLOOR_PCT:.0f}%")
+        for fila in tendencia["by_model_version"][-5:]:
+            print(f"    {fila['model_version']}: {fila['accuracy']:.2f} en {fila['cycles']} ciclos reales")
+        try:
+            db.set_state("accuracy_trend", tendencia)
+        except Exception as exc:  # noqa: BLE001 - la bitácora no debe tumbar la revisión
+            print(f"Aviso: no se pudo guardar accuracy_trend ({exc}).")
     print("  accuracy 24h por estación (vs referencia):")
     for estacion, valor in por_estacion.sort_values().items():
         delta = caida_estacion.get(estacion)
@@ -242,6 +335,7 @@ def compute_and_store() -> dict:
         "overall": overall, "rolling_24h": rolling, "reference": referencia,
         "drop_pct": caida, "triggered": triggered, "source": origen,
         "last_cycles": ultimos_ciclos, "reasons": motivos, "stations_degraded": list(rotas.index),
+        "trend": tendencia,
     }
 
 

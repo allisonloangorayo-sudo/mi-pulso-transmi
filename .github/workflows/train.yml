@@ -2,9 +2,16 @@ name: pulso-transmi-train
 
 on:
   workflow_dispatch:
-  # Programación opcional (ej. diaria); actívala cuando el equipo lo decida.
-  # schedule:
-  #   - cron: "0 6 * * *"
+  # Actualización horaria. El disparo principal lo hace drift.yml (cada hora
+  # vía cron-job.org, regla "actualización horaria" de src/drift.py); este
+  # schedule es respaldo por si GitHub lo llega a ejecutar.
+  schedule:
+    - cron: "20 * * * *"
+
+# Un solo entrenamiento a la vez; uno que llegue mientras otro corre espera.
+concurrency:
+  group: pulso-transmi-train
+  cancel-in-progress: false
 
 jobs:
   train:
