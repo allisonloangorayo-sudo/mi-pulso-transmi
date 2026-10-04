@@ -18,7 +18,10 @@ reentrenamiento (train.yml) si ocurre cualquiera de estas cosas:
 4. El champion está viejo: su corte de datos quedó más de MAX_STALENESS_H
    horas (virtuales) detrás del dato más reciente. Medido en la ventana
    competitiva: reentrenar a diario vale +1.5 pts frente a un modelo fijo, y
-   cada 6 h otros +0.35 (83.81 → 84.16).
+   cada 6 h otros +0.35 (83.81 → 84.16). Desde que el generador cambia la
+   forma de la serie (~cada 2 días virtuales) se baja a 3 h: el GBM pasa de
+   ~60% a ~90% en cuanto ve unas horas del régimen nuevo
+   (experiments/07_regimen_adaptativo.py).
 
 Para no disparar cada hora mientras un reentrenamiento ya está en curso (o
 cuando el candidato no logró superar al champion), hay un enfriamiento de
@@ -43,7 +46,7 @@ CRITICAL_DROP_PCT = float(os.getenv("DRIFT_CRITICAL_DROP_PCT", "5.0"))
 ACCURACY_FLOOR_PCT = float(os.getenv("DRIFT_ACCURACY_FLOOR_PCT", "80.0"))
 FLOOR_WINDOW_CYCLES = 6  # igual que la tabla "últimos 6 ciclos" del portal
 STATION_DROP_PCT = float(os.getenv("DRIFT_STATION_DROP_PCT", "10.0"))
-MAX_STALENESS_H = float(os.getenv("DRIFT_MAX_STALENESS_H", "6"))
+MAX_STALENESS_H = float(os.getenv("DRIFT_MAX_STALENESS_H", "3"))
 COOLDOWN_H = float(os.getenv("DRIFT_COOLDOWN_H", "2"))
 MIN_SAMPLE_SIZE = 48  # al menos un ciclo (12 estaciones x 4 horizontes) evaluado
 MIN_STATION_SAMPLE = 24  # 6 ciclos por estación antes de juzgarla sola

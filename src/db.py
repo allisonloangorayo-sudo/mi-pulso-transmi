@@ -260,10 +260,15 @@ def promote_if_better(version: str, validation_metric: float) -> bool:
 
 
 def insert_evaluations(records: list[dict[str, Any]]) -> None:
+    """Upsert, no insert: el reloj simulado vuelve a recorrer los mismos
+    instantes y un insert simple chocaba con la llave única en cada vuelta
+    (infer.yml falló así durante horas)."""
     if not records:
         return
-    client = get_client()
-    client.table("evaluations").insert([{k: _json_safe(v) for k, v in r.items()} for r in records]).execute()
+    filas = [{"source": "simulado", **{k: _json_safe(v) for k, v in r.items()}} for r in records]
+    upsert_in_chunks(
+        "evaluations", filas, on_conflict="station_id,target_at,model_version,source"
+    )
 
 
 def insert_drift_metric(record: dict[str, Any]) -> None:

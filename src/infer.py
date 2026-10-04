@@ -18,12 +18,12 @@ from datetime import timedelta
 import pandas as pd
 from dotenv import load_dotenv
 
-from src import db, model
+from src import db
 from src.data import fetch_all_observations
-from src.features import HORIZONS, build_serving_design
+from src.features import HORIZONS
 from src.predict import (
     NoOpenCycle,
-    double_check_predictions,
+    forecast_with_check,
     get_current_cycle,
     load_champion,
 )
@@ -64,13 +64,10 @@ def run_simulated_cycle() -> None:
 
     bundle, champion = load_champion()
     conocido = observations[observations["observed_at"] <= cutoff]
-    design = build_serving_design(conocido, targets)
-    design = design.dropna(subset=model.required_features(bundle)).reset_index(drop=True)
+    design = forecast_with_check(bundle, conocido, targets).rename(columns={"target_at": "observed_at"})
     if design.empty:
         print("Simulación sin historial suficiente todavía.")
         return
-
-    design["value"] = double_check_predictions(bundle, design)
 
     cycle_id = f"sim-{cutoff.isoformat()}"
     pred_records = [
@@ -87,7 +84,7 @@ def run_simulated_cycle() -> None:
         "predictions", pred_records, on_conflict="cycle_id,station_id,target_at,model_version"
     )
 
-    real = observations.set_index(["station_id", "observed_at"])["demand"]
+    real = observations[~observations["imputed"]].set_index(["station_id", "observed_at"])["demand"]
     evaluaciones = []
     for fila in design.to_dict(orient="records"):
         clave = (fila["station_id"], pd.Timestamp(fila["observed_at"]))

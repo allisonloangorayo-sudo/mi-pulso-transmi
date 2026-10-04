@@ -98,10 +98,15 @@ def predict_bundle(bundle: dict, design: pd.DataFrame) -> np.ndarray:
 
 
 def double_check_predictions(bundle: dict, design: pd.DataFrame) -> np.ndarray:
-    """Dos inferencias sobre el mismo batch antes de enviar nada."""
+    """Dos inferencias sobre el mismo batch antes de enviar nada.
+
+    `equal_nan=True` porque un NaN no es no-determinismo: así fue como el
+    cambio de esquema del stream se disfrazó de "doble verificación falló" y
+    abortó todos los envíos. Los NaN se resuelven después con un fallback.
+    """
     primera = predict_bundle(bundle, design)
     segunda = predict_bundle(bundle, design)
-    if not np.allclose(primera, segunda):
+    if not np.allclose(primera, segunda, equal_nan=True):
         raise RuntimeError(
             "Doble verificación falló: dos inferencias sobre el mismo batch "
             "dieron resultados distintos. Se aborta el envío."
@@ -109,24 +114,38 @@ def double_check_predictions(bundle: dict, design: pd.DataFrame) -> np.ndarray:
     return primera
 
 
+def forecast_with_check(bundle: dict, observations: pd.DataFrame, targets: pd.DataFrame) -> pd.DataFrame:
+    """Dos inferencias sobre el mismo batch y, después, cero huecos.
+
+    `equal_nan=True` porque un NaN no es no-determinismo: así fue como el
+    cambio de esquema del stream se disfrazó de "doble verificación falló" y
+    abortó todos los envíos. Un target sin valor puntúa 0; uno aproximado no,
+    así que los NaN se reemplazan por el último dato conocido de la estación.
+    """
+    primera = model.forecast_targets(bundle, observations, targets)
+    segunda = model.forecast_targets(bundle, observations, targets)
+    if not np.allclose(primera["value"], segunda["value"], equal_nan=True):
+        raise RuntimeError(
+            "Doble verificación falló: dos inferencias sobre el mismo batch "
+            "dieron resultados distintos. Se aborta el envío."
+        )
+    valores = primera["value"].to_numpy(dtype=float)
+    malos = ~np.isfinite(valores)
+    if malos.any():
+        print(f"AVISO: {int(malos.sum())} predicciones no finitas; se usa el último dato conocido.")
+        valores = np.where(malos, primera["fallback"].to_numpy(dtype=float), valores)
+        malos = ~np.isfinite(valores)
+        if malos.any():
+            valores[malos] = float(np.nanmedian(valores)) if np.isfinite(valores).any() else 0.0
+    return primera.assign(value=np.clip(valores, 0, None))
+
+
 def build_batch(cycle: dict, bundle: dict) -> pd.DataFrame:
     targets = targets_to_frame(cycle["targets"])
     observations = fetch_all_observations()
     observations = observations[observations["observed_at"] <= pd.Timestamp(cycle["data_cutoff"])]
-
-    design = build_serving_design(observations, targets).reset_index(drop=True)
-    columnas = model.required_features(bundle)
-    faltantes = design[columnas].isna().any(axis=1)
-    if faltantes.any():
-        # Sin historial suficiente para esa estación: se rellena con la mediana
-        # en vez de enviar un hueco (un target ausente puntúa 0).
-        design.loc[faltantes, columnas] = design.loc[faltantes, columnas].fillna(
-            design[columnas].median()
-        )
-
-    design["value"] = double_check_predictions(bundle, design)
-    design = design.rename(columns={"observed_at": "target_at"})
-    return design[["station_id", "target_at", "horizon", "value"]]
+    batch = forecast_with_check(bundle, observations, targets)
+    return batch[["station_id", "target_at", "horizon", "value"]]
 
 
 def validate_exact_targets(predictions: pd.DataFrame, targets: list[dict]) -> None:

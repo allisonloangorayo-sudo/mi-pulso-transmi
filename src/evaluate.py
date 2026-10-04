@@ -55,6 +55,8 @@ def run() -> None:
         return
 
     observaciones = fetch_all_observations()
+    # Un valor imputado no es la demanda real: no sirve para evaluar.
+    observaciones = observaciones[~observaciones["imputed"]]
     real = observaciones.set_index(["station_id", "observed_at"])["demand"]
 
     registros = []

@@ -9,7 +9,7 @@ on:
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60   # CV + duelo entrenan 4 veces el ensamble (GBM + modelo por nivel)
     steps:
       - uses: actions/checkout@v4
 

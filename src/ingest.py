@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from pulso_transmi import PulsoTransmiClient
 
 from src import db
+from src.data import parse_stream_records
 from src.http_utils import request_with_retry
 
 load_dotenv()
@@ -60,7 +61,7 @@ def sync_stream() -> int:
     cursor = cursor_row["last_cursor"] if cursor_row else None
     cursor_before = cursor
 
-    frames = []
+    records = []
     while True:
         params = {"limit": 5000}
         if cursor:
@@ -70,20 +71,24 @@ def sync_stream() -> int:
         )
         response.raise_for_status()
         page = response.json()
-        if page["data"]:
-            frames.append(pd.DataFrame(page["data"]))
+        records.extend(page["data"] or [])
         cursor = page.get("next_cursor")
         if cursor is None:
             break
 
-    if not frames:
+    if not records:
         db.log_ingestion_run(stream="stream_observations", rows_fetched=0, status="no_new_data")
         return 0
 
-    stream_df = pd.concat(frames, ignore_index=True)
-    stream_df["observed_at"] = pd.to_datetime(stream_df["observed_at"], utc=True)
-    stream_df["station_id"] = stream_df["station_id"].astype("string")
-    n = db.upsert_observations(stream_df[["station_id", "observed_at", "demand"]])
+    # Acepta el esquema 1 (`demand`) y el 2 (`measurement.value`, texto). Las
+    # mediciones `quality: missing` no se guardan (la columna es NOT NULL):
+    # src.data.fill_gaps las imputa al entrenar e inferir.
+    stream_df = parse_stream_records(records)
+    faltantes = int(stream_df["demand"].isna().sum())
+    if faltantes:
+        print(f"Stream: {faltantes} mediciones faltantes omitidas (se imputan al modelar).")
+    medidas = stream_df.dropna(subset=["demand"])
+    n = db.upsert_observations(medidas[["station_id", "observed_at", "demand"]])
 
     db.log_ingestion_run(
         stream="stream_observations", rows_fetched=n, status="ok", cursor_before=cursor_before, cursor_after=cursor

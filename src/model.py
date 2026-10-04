@@ -23,9 +23,12 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 
-from src.features import EPS, FEATURE_COLUMNS, GLOBAL_FEATURES, LEVEL_COLUMNS
+from src import adaptive
+from src.features import EPS, FEATURE_COLUMNS, GLOBAL_FEATURES, LEVEL_COLUMNS, build_serving_design
 
 GLOBAL_SCALES = ("roll96", "roll16", "exp_w")
+# Columnas que valen como "último dato conocido" en cada tipo de diseño.
+FALLBACK_COLUMNS = ("a0", "s0")
 
 
 def _per_station_model() -> HistGradientBoostingRegressor:
@@ -73,6 +76,8 @@ def train_per_station(design: pd.DataFrame) -> dict:
 
 def predict(bundle: dict, design: pd.DataFrame) -> np.ndarray:
     design = design.reset_index(drop=True)
+    if bundle.get("kind") == "adaptive_ensemble":
+        return adaptive.predict(bundle, design)
     if bundle.get("kind") == "global_norm":
         salidas = []
         for scale, modelo in bundle["models"].items():
@@ -90,7 +95,29 @@ def predict(bundle: dict, design: pd.DataFrame) -> np.ndarray:
     return np.clip(salida, 0, None)
 
 
+def forecast_targets(bundle: dict, observations: pd.DataFrame, targets: pd.DataFrame) -> pd.DataFrame:
+    """Predicción de `targets` (station_id, target_at, horizon) para cualquier bundle.
+
+    Devuelve station_id, target_at, horizon, value y `fallback` (último dato
+    conocido), que se usa si el modelo no puede producir un valor.
+    """
+    if bundle.get("kind") == "adaptive_ensemble":
+        salida = adaptive.forecast_targets(bundle, observations, targets)
+        return salida.rename(columns={"a0": "fallback"})
+
+    design = build_serving_design(observations, targets).reset_index(drop=True)
+    design["value"] = predict(bundle, design)
+    design["fallback"] = design["s0"]
+    salida = design.rename(columns={"observed_at": "target_at"})
+    return targets.merge(
+        salida[["station_id", "target_at", "horizon", "value", "fallback"]],
+        on=["station_id", "target_at", "horizon"], how="left",
+    )
+
+
 def required_features(bundle: dict) -> list[str]:
+    if bundle.get("kind") == "adaptive_ensemble":
+        return list(adaptive.REQUIRED)
     if bundle.get("kind") == "global_norm":
         return [c for c in GLOBAL_FEATURES if c != "station_code"]
     return FEATURE_COLUMNS

@@ -115,7 +115,66 @@ compara contra dos baselines (repetir 24h antes / 7 días antes), corre una
 doble verificación de determinismo y solo promueve si el **peor** pliegue
 supera al champion vigente.
 
-## Modelo actual: global normalizado por nivel (2026-09-27)
+## Modelo actual: ensamble adaptativo al régimen (2026-10-04)
+
+**Incidente:** la accuracy de los últimos 6 ciclos cayó a 0. No era el modelo:
+`infer.yml` y `collector.yml` fallaban en cada corrida.
+
+1. **Cambio de esquema del stream.** Desde el instante virtual 2026-09-20
+   12:15 las filas llegan como `schema_version: 2` con
+   `measurement: {value: "546.00", unit, quality}` en vez de `demand`. El
+   código leía `demand` → NaN → predicciones NaN → `allclose(NaN, NaN)` es
+   False → "doble verificación falló" → no se envió ningún ciclo (un target
+   sin envío puntúa 0). `src/data.py` ahora entiende ambos esquemas, trata
+   `quality: missing` como hueco y lo imputa (`fill_gaps`, columna `imputed`).
+   Los valores imputados nunca se usan como objetivo ni para evaluar.
+2. El collector intentaba guardar esos nulos en una columna `NOT NULL`.
+3. La simulación chocaba con la llave única de `evaluations` (ahora upsert).
+
+Además, una predicción no finita ya no aborta el envío: se reemplaza por el
+último dato conocido de la estación (`predict.forecast_with_check`).
+
+**Drift real.** Explorando los datos nuevos apareció algo más grave que el
+cambio de esquema: el generador cambia la *forma* de la serie, no solo el
+nivel.
+
+| Periodo (virtual) | Estacionalidad dominante (ACF) |
+|---|---|
+| hasta 18-sep 02:00 | diaria, 96 pasos |
+| 18-sep 02:00 → 20-sep 12:00 | **16 pasos (4 h)**, ACF ≈ 0.8 en las 12 estaciones |
+| desde 20-sep 12:00 | **~32 pasos (8 h)**, fase distinta por estación |
+
+El modelo por nivel dependía de "ayer / la semana pasada a esta hora" y cayó
+a 44-58% en esos tramos. [`src/adaptive.py`](src/adaptive.py) lo reemplaza:
+
+- **Periodo adaptativo:** en cada corte y por estación se elige el periodo
+  (8..100 pasos) cuyo naive estacional tuvo menor error reciente (ventanas de
+  16 y 48 pasos), y se usan los valores en la misma fase 1 y 2 periodos atrás.
+- **GBM global normalizado** sobre esas features, con peso por recencia
+  (vida media de 7 días) para que un régimen nuevo pese aunque sea minoría.
+- **Ensamble online de 8 expertos** (GBM, el modelo por nivel anterior,
+  naive estacional, ajustes por nivel, último dato): el peso de cada uno se
+  recalcula en cada corte según su error en los últimos 8 targets ya
+  conocidos de esa estación y horizonte. Cambia de experto en horas, sin
+  esperar a un reentrenamiento.
+- `drift.py` reentrena cada 3 h virtuales (antes 6).
+
+Evidencia en [`experiments/07_regimen_adaptativo.py`](experiments/07_regimen_adaptativo.py)
+(walk-forward con el código de producción, métrica oficial, 4 horizontes):
+
+| Bloque de 12 h desde | Anterior | **Nuevo** |
+|---|---|---|
+| 18-sep 01:30 (cambio a ciclo de 4 h) | 44.7 | **59.4** |
+| 18-sep 13:30 | 53.7 | **89.4** |
+| 19-sep 01:30 | 74.4 | **90.8** |
+| 19-sep 13:30 | 83.8 | **90.8** |
+| 20-sep 13:30 (cambio a ~8 h + esquema v2) | 58.2 | **72.7** |
+
+Con reentreno cada 6 h, las últimas 6 h del histórico dan **81.4%**.
+`python -m src.train` sobre los datos actuales: pliegues de 2 días con el
+modelo fijo → **84.81%** y **81.36%** (mejor baseline: 60.9% y 64.8%).
+
+## Modelo anterior: global normalizado por nivel (2026-09-27)
 
 En la ventana competitiva el modelo por estación cayó a **76.5% real** (7.º
 lugar, 80.44% acumulado). La causa: desde el 13-sep la estación 05100 opera
