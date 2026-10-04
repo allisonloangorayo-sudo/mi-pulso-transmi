@@ -164,15 +164,20 @@ Evidencia en [`experiments/07_regimen_adaptativo.py`](experiments/07_regimen_ada
 
 | Bloque de 12 h desde | Anterior | **Nuevo** |
 |---|---|---|
-| 18-sep 01:30 (cambio a ciclo de 4 h) | 44.7 | **59.4** |
-| 18-sep 13:30 | 53.7 | **89.4** |
-| 19-sep 01:30 | 74.4 | **90.8** |
-| 19-sep 13:30 | 83.8 | **90.8** |
-| 20-sep 13:30 (cambio a ~8 h + esquema v2) | 58.2 | **72.7** |
+| 14-sep → 17-sep (régimen diario) | 83.8–89.2 | **81.9–89.7** |
+| 18-sep 01:30 (cambio a ciclo de 4 h) | 44.7 | **58.7** |
+| 18-sep 13:30 | 53.7 | **89.0** |
+| 19-sep 01:30 | 74.4 | **90.7** |
+| 19-sep 13:30 | 83.8 | **90.7** |
+| 20-sep 13:30 (cambio a ~8 h + esquema v2) | 58.2 | **72.5** |
+| **Total 14 → 21-sep** | — | **83.67** |
 
 Con reentreno cada 6 h, las últimas 6 h del histórico dan **81.4%**.
-`python -m src.train` sobre los datos actuales: pliegues de 2 días con el
-modelo fijo → **84.81%** y **81.36%** (mejor baseline: 60.9% y 64.8%).
+
+Primer entrenamiento en producción (`train.yml`, champion `v20261004T150454Z`):
+pliegues de 2 días con el modelo fijo → **84.92%** y **81.41%** (mejor
+baseline: 61.2% y 64.6%); duelo sobre 3.204 filas que ninguno vio →
+**74.11 vs 59.44** del champion anterior.
 
 ## Modelo anterior: global normalizado por nivel (2026-09-27)
 
