@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from pulso_transmi import PulsoTransmiClient
+from pulso_transmi.client import PulsoTransmiError
 
 from src.http_utils import request_with_retry
 
@@ -164,13 +166,27 @@ def fetch_stream_observations() -> pd.DataFrame:
     return parse_stream_records(fetch_stream_records())
 
 
+def _static_observations(intentos: int = 4) -> pd.DataFrame:
+    """Histórico estático vía SDK, con reintentos: el SDK no reintenta y un
+    ConnectTimeout aislado tumbó una corrida de infer.yml (2026-10-04)."""
+    for intento in range(1, intentos + 1):
+        try:
+            with PulsoTransmiClient(timeout=45.0) as client:
+                return client.observations_dataframe()
+        except PulsoTransmiError as exc:
+            if intento == intentos:
+                raise
+            print(f"Histórico estático: intento {intento} falló ({exc}); reintento.", file=sys.stderr)
+            time.sleep(2.0 * intento)
+    raise AssertionError("inalcanzable")
+
+
 def fetch_all_observations() -> pd.DataFrame:
     """Histórico + stream, en grilla completa de 15 min, con huecos imputados.
 
     Columnas: station_id, observed_at, demand (nunca NaN), imputed (bool).
     """
-    with PulsoTransmiClient() as client:
-        static = client.observations_dataframe()
+    static = _static_observations()
     static = static[["station_id", "observed_at", "demand"]].assign(quality="observed")
 
     stream = fetch_stream_observations()
